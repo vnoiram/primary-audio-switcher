@@ -47,6 +47,7 @@ namespace PrimaryAudioSwitcher
         private ManagementEventWatcher _processStopWatcher;
         private ManagementEventWatcher _deviceChangeWatcher;
         private readonly Dictionary<string, string> _previousDeviceByRule = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        private readonly List<SwitchHistoryItem> _switchHistory = new List<SwitchHistoryItem>();
         private AppConfig _config;
         private string _lastAppliedDeviceId;
         private string _lastStatus = "Starting";
@@ -208,6 +209,7 @@ namespace PrimaryAudioSwitcher
             _audio.SetDefaultRenderDevice(device.Id);
             _lastAppliedDeviceId = device.Id;
             _lastSwitchAt = DateTimeOffset.Now;
+            AddSwitchHistory(ruleName, device.Name, foreground, force);
             SetStatus("Rule: " + ruleName + " -> " + device.Name);
             ShowNotification("Audio device changed", device.Name + " (" + ruleName + ")");
             Log("Applied rule='" + ruleName + "' foreground='" + (foreground ?? "unknown") + "' device='" + device.Name + "'" + (force ? " force=true" : ""));
@@ -513,7 +515,7 @@ namespace PrimaryAudioSwitcher
 
         private void OpenSettings()
         {
-            using (var form = new SettingsForm(_config, _audio))
+            using (var form = new SettingsForm(_config, _audio, _switchHistory))
             {
                 if (form.ShowDialog() != DialogResult.OK)
                 {
@@ -692,6 +694,15 @@ namespace PrimaryAudioSwitcher
             _notifyIcon.BalloonTipTitle = title;
             _notifyIcon.BalloonTipText = text;
             _notifyIcon.ShowBalloonTip(2000);
+        }
+
+        private void AddSwitchHistory(string ruleName, string deviceName, string trigger, bool forced)
+        {
+            _switchHistory.Insert(0, new SwitchHistoryItem(DateTimeOffset.Now, ruleName, deviceName, trigger, forced));
+            while (_switchHistory.Count > 50)
+            {
+                _switchHistory.RemoveAt(_switchHistory.Count - 1);
+            }
         }
 
         private void Log(string message)
@@ -1042,6 +1053,32 @@ namespace PrimaryAudioSwitcher
             };
         }
 
+        public XElement ToXml()
+        {
+            var element = new XElement("Rule",
+                new XAttribute("name", Name ?? ""),
+                new XAttribute("enabled", Enabled ? "true" : "false"),
+                new XAttribute("windowTitle", WindowTitle ?? ""),
+                new XAttribute("device", Device ?? ""),
+                new XAttribute("deviceId", DeviceId ?? ""),
+                new XAttribute("alternateDevice", AlternateDevice ?? ""),
+                new XAttribute("alternateDeviceId", AlternateDeviceId ?? ""),
+                new XAttribute("retryCount", RetryCount),
+                new XAttribute("retryDelayMilliseconds", RetryDelayMilliseconds),
+                new XAttribute("exitDelayMilliseconds", ExitDelayMilliseconds));
+
+            if (!string.IsNullOrWhiteSpace(ForegroundProcess))
+            {
+                element.SetAttributeValue("foregroundProcess", ForegroundProcess);
+            }
+            else if (!string.IsNullOrWhiteSpace(RunningProcess))
+            {
+                element.SetAttributeValue("runningProcess", RunningProcess);
+            }
+
+            return element;
+        }
+
         public override string ToString()
         {
             var mode = !string.IsNullOrWhiteSpace(ForegroundProcess) ? "foreground" : "running";
@@ -1100,6 +1137,33 @@ namespace PrimaryAudioSwitcher
         }
     }
 
+    internal sealed class SwitchHistoryItem
+    {
+        public SwitchHistoryItem(DateTimeOffset timestamp, string ruleName, string deviceName, string trigger, bool forced)
+        {
+            Timestamp = timestamp;
+            RuleName = ruleName;
+            DeviceName = deviceName;
+            Trigger = trigger;
+            Forced = forced;
+        }
+
+        public DateTimeOffset Timestamp { get; private set; }
+        public string RuleName { get; private set; }
+        public string DeviceName { get; private set; }
+        public string Trigger { get; private set; }
+        public bool Forced { get; private set; }
+
+        public override string ToString()
+        {
+            return Timestamp.ToString("yyyy-MM-dd HH:mm:ss") +
+                   " | " + (RuleName ?? "") +
+                   " -> " + (DeviceName ?? "") +
+                   " | " + (Trigger ?? "unknown") +
+                   (Forced ? " | forced" : "");
+        }
+    }
+
     internal sealed class SettingsForm : Form
     {
         private readonly AudioDeviceManager _audio;
@@ -1125,10 +1189,14 @@ namespace PrimaryAudioSwitcher
         private readonly CheckBox _notifications = new CheckBox();
         private readonly CheckBox _enabled = new CheckBox();
         private readonly Label _currentDevice = new Label();
+        private readonly Label _matchingRules = new Label();
+        private readonly ListBox _history = new ListBox();
+        private readonly IReadOnlyList<SwitchHistoryItem> _switchHistory;
 
-        public SettingsForm(AppConfig config, AudioDeviceManager audio)
+        public SettingsForm(AppConfig config, AudioDeviceManager audio, IReadOnlyList<SwitchHistoryItem> switchHistory)
         {
             _audio = audio;
+            _switchHistory = switchHistory;
             Config = config.Clone();
 
             Text = "Primary Audio Switcher Settings";
@@ -1279,8 +1347,12 @@ namespace PrimaryAudioSwitcher
             ruleButtons.Controls.Add(MakeButton("Add", AddRule));
             ruleButtons.Controls.Add(MakeButton("Update", UpdateRule));
             ruleButtons.Controls.Add(MakeButton("Delete", DeleteRule));
+            ruleButtons.Controls.Add(MakeButton("Duplicate", DuplicateRule));
             ruleButtons.Controls.Add(MakeButton("Up", MoveRuleUp));
             ruleButtons.Controls.Add(MakeButton("Down", MoveRuleDown));
+            ruleButtons.Controls.Add(MakeButton("Use current", UseCurrentForeground));
+            ruleButtons.Controls.Add(MakeButton("Export", ExportRule));
+            ruleButtons.Controls.Add(MakeButton("Import", ImportRule));
             ruleButtons.Controls.Add(MakeButton("Test", TestRule));
             editor.Controls.Add(ruleButtons, 1, 9);
             editor.SetColumnSpan(ruleButtons, 2);
@@ -1363,7 +1435,7 @@ namespace PrimaryAudioSwitcher
             {
                 Dock = DockStyle.Fill,
                 ColumnCount = 3,
-                RowCount = 3,
+                RowCount = 4,
                 Padding = new Padding(10)
             };
             editor.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 120));
@@ -1371,6 +1443,7 @@ namespace PrimaryAudioSwitcher
             editor.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 150));
             editor.RowStyles.Add(new RowStyle(SizeType.Absolute, 36));
             editor.RowStyles.Add(new RowStyle(SizeType.Absolute, 40));
+            editor.RowStyles.Add(new RowStyle(SizeType.Absolute, 36));
             editor.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
             tab.Controls.Add(editor);
 
@@ -1385,6 +1458,16 @@ namespace PrimaryAudioSwitcher
             buttons.Controls.Add(MakeButton("View log", ViewLog));
             editor.Controls.Add(buttons, 1, 1);
             editor.SetColumnSpan(buttons, 2);
+
+            AddLabel(editor, "Matching", 2);
+            _matchingRules.Dock = DockStyle.Fill;
+            _matchingRules.TextAlign = ContentAlignment.MiddleLeft;
+            editor.Controls.Add(_matchingRules, 1, 2);
+            editor.SetColumnSpan(_matchingRules, 2);
+
+            _history.Dock = DockStyle.Fill;
+            editor.Controls.Add(_history, 0, 3);
+            editor.SetColumnSpan(_history, 3);
         }
 
         private static void AddLabel(TableLayoutPanel panel, string text, int row)
@@ -1482,6 +1565,7 @@ namespace PrimaryAudioSwitcher
             LoadDeviceList();
             LoadProcessList();
             RefreshCurrentDeviceLabel();
+            ReloadRuleList();
         }
 
         private void ViewLog(object sender, EventArgs args)
@@ -1557,6 +1641,82 @@ namespace PrimaryAudioSwitcher
             if (_rules.Items.Count > 0)
             {
                 _rules.SelectedIndex = Math.Min(selected, _rules.Items.Count - 1);
+            }
+        }
+
+        private void DuplicateRule(object sender, EventArgs args)
+        {
+            if (_rules.SelectedIndex < 0)
+            {
+                return;
+            }
+
+            var copy = Config.Rules[_rules.SelectedIndex].Clone();
+            copy.Name = (copy.Name ?? "unnamed") + " copy";
+            var target = _rules.SelectedIndex + 1;
+            Config.Rules.Insert(target, copy);
+            ReloadRuleList();
+            _rules.SelectedIndex = target;
+        }
+
+        private void UseCurrentForeground(object sender, EventArgs args)
+        {
+            var foreground = ForegroundWindowReader.GetForegroundWindowInfo();
+            if (string.IsNullOrWhiteSpace(foreground.ProcessName))
+            {
+                MessageBox.Show(this, "Foreground process was not available.", "Settings", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+            _mode.SelectedIndex = 0;
+            _process.Text = foreground.ProcessName;
+            _windowTitle.Text = foreground.Title ?? "";
+            if (string.IsNullOrWhiteSpace(_name.Text))
+            {
+                _name.Text = foreground.ProcessName;
+            }
+        }
+
+        private void ExportRule(object sender, EventArgs args)
+        {
+            var rule = ReadEditorRule();
+            if (rule == null)
+            {
+                return;
+            }
+
+            using (var dialog = new SaveFileDialog())
+            {
+                dialog.Filter = "XML rule (*.xml)|*.xml|All files (*.*)|*.*";
+                dialog.FileName = (rule.Name ?? "rule") + ".xml";
+                if (dialog.ShowDialog(this) == DialogResult.OK)
+                {
+                    new XDocument(new XDeclaration("1.0", "utf-8", "yes"), rule.ToXml()).Save(dialog.FileName);
+                }
+            }
+        }
+
+        private void ImportRule(object sender, EventArgs args)
+        {
+            using (var dialog = new OpenFileDialog())
+            {
+                dialog.Filter = "XML rule (*.xml)|*.xml|All files (*.*)|*.*";
+                if (dialog.ShowDialog(this) != DialogResult.OK)
+                {
+                    return;
+                }
+
+                var document = XDocument.Load(dialog.FileName);
+                if (document.Root == null || document.Root.Name != "Rule")
+                {
+                    MessageBox.Show(this, "Rule XML must have a <Rule> root element.", "Settings", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    return;
+                }
+
+                var rule = AudioRule.FromXml(document.Root, 3, 500);
+                Config.Rules.Add(rule);
+                ReloadRuleList();
+                _rules.SelectedIndex = _rules.Items.Count - 1;
             }
         }
 
@@ -1690,10 +1850,51 @@ namespace PrimaryAudioSwitcher
 
         private void ReloadRuleList()
         {
+            var matching = GetMatchingRuleIndexes();
             _rules.Items.Clear();
-            foreach (var rule in Config.Rules)
+            for (var i = 0; i < Config.Rules.Count; i++)
             {
-                _rules.Items.Add(rule);
+                _rules.Items.Add((matching.Contains(i) ? ">> " : "") + Config.Rules[i]);
+            }
+            RefreshStatusSummaries(matching);
+        }
+
+        private HashSet<int> GetMatchingRuleIndexes()
+        {
+            var result = new HashSet<int>();
+            var foreground = ForegroundWindowReader.GetForegroundWindowInfo();
+            var running = new HashSet<string>(
+                Process.GetProcesses()
+                    .Select(p => SafeProcessName(p))
+                    .Where(name => !string.IsNullOrWhiteSpace(name)),
+                StringComparer.OrdinalIgnoreCase);
+
+            for (var i = 0; i < Config.Rules.Count; i++)
+            {
+                if (Config.Rules[i].IsMatch(foreground, running))
+                {
+                    result.Add(i);
+                }
+            }
+
+            return result;
+        }
+
+        private void RefreshStatusSummaries(HashSet<int> matching)
+        {
+            if (matching.Count == 0)
+            {
+                _matchingRules.Text = "none";
+            }
+            else
+            {
+                _matchingRules.Text = string.Join(", ", matching.Select(index => Config.Rules[index].Name ?? "unnamed"));
+            }
+
+            _history.Items.Clear();
+            foreach (var item in _switchHistory)
+            {
+                _history.Items.Add(item.ToString());
             }
         }
 

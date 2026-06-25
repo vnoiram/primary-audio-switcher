@@ -78,6 +78,11 @@ Settings are split into tabs:
 - Open `Diagnostics` from the tray menu to inspect foreground process/title, active devices, running processes, and matching rules.
 - Restore the previous `config.xml.bak` from the tray menu.
 - Re-evaluate rules automatically when Windows reports device connection changes.
+- Duplicate rules from the `Rules` tab.
+- Fill a rule from the current foreground app with `Use current`.
+- Export or import a single rule as XML.
+- See currently matching rules highlighted with `>>` in the rule list.
+- Review recent switch history in the `Status` tab.
 
 ## Config
 
