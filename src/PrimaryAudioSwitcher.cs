@@ -10,6 +10,7 @@ using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
 using System.Windows.Forms;
+using System.Xml;
 using System.Xml.Linq;
 
 namespace PrimaryAudioSwitcher
@@ -807,7 +808,7 @@ namespace PrimaryAudioSwitcher
 
         public static AppConfig Load(string path)
         {
-            var document = XDocument.Load(path);
+            var document = XmlFiles.LoadSecure(path);
             var root = document.Root;
             if (root == null || root.Name != "PrimaryAudioSwitcher")
             {
@@ -909,6 +910,28 @@ namespace PrimaryAudioSwitcher
   <Rule name=""Discord running"" enabled=""true"" runningProcess=""Discord"" windowTitle="""" device=""Headset"" deviceId="""" alternateDevice="""" alternateDeviceId="""" retryCount=""3"" retryDelayMilliseconds=""500"" exitDelayMilliseconds=""0"" />
 </PrimaryAudioSwitcher>
 ";
+    }
+
+    internal static class XmlFiles
+    {
+        public static XDocument LoadSecure(string path)
+        {
+            var settings = new XmlReaderSettings
+            {
+                DtdProcessing = DtdProcessing.Prohibit,
+                XmlResolver = null,
+                IgnoreComments = true,
+                IgnoreProcessingInstructions = true,
+                MaxCharactersFromEntities = 0,
+                MaxCharactersInDocument = 1024 * 1024
+            };
+
+            using (var stream = File.OpenRead(path))
+            using (var reader = XmlReader.Create(stream, settings))
+            {
+                return XDocument.Load(reader, LoadOptions.None);
+            }
+        }
     }
 
     internal enum ProcessExitAction
@@ -1706,7 +1729,7 @@ namespace PrimaryAudioSwitcher
                     return;
                 }
 
-                var document = XDocument.Load(dialog.FileName);
+                var document = XmlFiles.LoadSecure(dialog.FileName);
                 if (document.Root == null || document.Root.Name != "Rule")
                 {
                     MessageBox.Show(this, "Rule XML must have a <Rule> root element.", "Settings", MessageBoxButtons.OK, MessageBoxIcon.Warning);

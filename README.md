@@ -127,3 +127,5 @@ When `deviceChangeWatcher` is enabled, the app subscribes to `Win32_DeviceChange
 ## Notes
 
 Changing the Windows default audio endpoint uses the same private Core Audio policy COM interface commonly used by audio switcher tools. It is not a documented Microsoft API, so Windows updates could theoretically change behavior.
+
+XML config and rule imports are loaded with DTD processing prohibited, external XML resolution disabled, and a 1 MB document size limit.
