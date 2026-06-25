@@ -96,12 +96,14 @@ namespace PrimaryAudioSwitcher
             menu.Items.Add("Settings", null, (sender, args) => OpenSettings());
             menu.Items.Add("Reload config", null, (sender, args) => ReloadConfig());
             menu.Items.Add("Open config", null, (sender, args) => Process.Start("notepad.exe", _configPath));
+            menu.Items.Add("Open config folder", null, (sender, args) => Process.Start("explorer.exe", Path.GetDirectoryName(_configPath)));
             menu.Items.Add("View log", null, (sender, args) => ViewLog());
             menu.Items.Add("Diagnostics", null, (sender, args) => ViewDiagnostics());
             menu.Items.Add("Write device list to log", null, (sender, args) => WriteDeviceList());
             menu.Items.Add("Export config", null, (sender, args) => ExportConfig());
             menu.Items.Add("Import config", null, (sender, args) => ImportConfig());
             menu.Items.Add("Restore config backup", null, (sender, args) => RestoreConfigBackup());
+            menu.Items.Add("About", null, (sender, args) => ShowAbout());
             menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add("Exit", null, (sender, args) => ExitThread());
             return menu;
@@ -658,6 +660,18 @@ namespace PrimaryAudioSwitcher
                 Log("Config backup restore failed: " + ex);
                 MessageBox.Show(ex.Message, "Primary Audio Switcher restore error", MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
+        }
+
+        private void ShowAbout()
+        {
+            MessageBox.Show(
+                "Primary Audio Switcher" + Environment.NewLine +
+                "Windows tray app for rule-based default audio device switching." + Environment.NewLine +
+                Environment.NewLine +
+                "Dependencies: .NET Framework / Windows Core Audio / WMI",
+                "About Primary Audio Switcher",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Information);
         }
 
         private void SetStatus(string status)
@@ -1377,6 +1391,7 @@ namespace PrimaryAudioSwitcher
             ruleButtons.Controls.Add(MakeButton("Export", ExportRule));
             ruleButtons.Controls.Add(MakeButton("Import", ImportRule));
             ruleButtons.Controls.Add(MakeButton("Test", TestRule));
+            ruleButtons.Controls.Add(MakeButton("Validate", ValidateRules));
             editor.Controls.Add(ruleButtons, 1, 9);
             editor.SetColumnSpan(ruleButtons, 2);
         }
@@ -1479,6 +1494,8 @@ namespace PrimaryAudioSwitcher
             var buttons = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.LeftToRight };
             buttons.Controls.Add(MakeButton("Refresh", RefreshLists));
             buttons.Controls.Add(MakeButton("View log", ViewLog));
+            buttons.Controls.Add(MakeButton("Save report", SaveDiagnosticsReport));
+            buttons.Controls.Add(MakeButton("Clear history", ClearHistory));
             editor.Controls.Add(buttons, 1, 1);
             editor.SetColumnSpan(buttons, 2);
 
@@ -1600,6 +1617,29 @@ namespace PrimaryAudioSwitcher
             using (var form = new LogViewerForm(path))
             {
                 form.ShowDialog(this);
+            }
+        }
+
+        private void SaveDiagnosticsReport(object sender, EventArgs args)
+        {
+            using (var dialog = new SaveFileDialog())
+            {
+                dialog.Filter = "Text report (*.txt)|*.txt|All files (*.*)|*.*";
+                dialog.FileName = "primary-audio-switcher-diagnostics.txt";
+                if (dialog.ShowDialog(this) == DialogResult.OK)
+                {
+                    File.WriteAllText(dialog.FileName, DiagnosticsReport.Build(Config, _audio, "settings report"));
+                }
+            }
+        }
+
+        private void ClearHistory(object sender, EventArgs args)
+        {
+            var list = _switchHistory as List<SwitchHistoryItem>;
+            if (list != null)
+            {
+                list.Clear();
+                ReloadRuleList();
             }
         }
 
@@ -1788,6 +1828,52 @@ namespace PrimaryAudioSwitcher
             _audio.SetDefaultRenderDevice(device.Id);
             RefreshCurrentDeviceLabel();
             MessageBox.Show(this, "Switched to " + device.Name + ".", "Settings", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }
+
+        private void ValidateRules(object sender, EventArgs args)
+        {
+            var messages = new List<string>();
+            if (Config.Rules.Count == 0)
+            {
+                messages.Add("No rules are configured.");
+            }
+            if (Config.Rules.Count > 0 && Config.Rules.All(rule => !rule.Enabled))
+            {
+                messages.Add("All rules are disabled.");
+            }
+
+            var names = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var rule in Config.Rules)
+            {
+                if (!string.IsNullOrWhiteSpace(rule.Name) && !names.Add(rule.Name))
+                {
+                    messages.Add("Duplicate rule name: " + rule.Name);
+                }
+                if (string.IsNullOrWhiteSpace(rule.ForegroundProcess) && string.IsNullOrWhiteSpace(rule.RunningProcess))
+                {
+                    messages.Add("Rule has no process: " + (rule.Name ?? "unnamed"));
+                }
+                if (_audio.FindRenderDevice(rule.DeviceId, rule.Device) == null)
+                {
+                    messages.Add("Primary device not found for rule: " + (rule.Name ?? "unnamed"));
+                }
+                if (rule.HasAlternateDevice && _audio.FindRenderDevice(rule.AlternateDeviceId, rule.AlternateDevice) == null)
+                {
+                    messages.Add("Alternate device not found for rule: " + (rule.Name ?? "unnamed"));
+                }
+            }
+
+            if (Config.HasFallbackDevice && _audio.FindRenderDevice(Config.FallbackDeviceId, Config.FallbackDevice) == null)
+            {
+                messages.Add("Fallback device was not found.");
+            }
+
+            MessageBox.Show(
+                this,
+                messages.Count == 0 ? "No validation issues found." : string.Join(Environment.NewLine, messages),
+                "Rule validation",
+                MessageBoxButtons.OK,
+                messages.Count == 0 ? MessageBoxIcon.Information : MessageBoxIcon.Warning);
         }
 
         private void SaveAndClose(object sender, EventArgs args)
@@ -2164,6 +2250,14 @@ namespace PrimaryAudioSwitcher
 
         private void RefreshDiagnostics()
         {
+            _text.Text = DiagnosticsReport.Build(_config, _audio, _status);
+        }
+    }
+
+    internal static class DiagnosticsReport
+    {
+        public static string Build(AppConfig config, AudioDeviceManager audio, string status)
+        {
             var builder = new StringBuilder();
             var foreground = ForegroundWindowReader.GetForegroundWindowInfo();
             var running = new HashSet<string>(
@@ -2172,14 +2266,14 @@ namespace PrimaryAudioSwitcher
                     .Where(name => !string.IsNullOrWhiteSpace(name)),
                 StringComparer.OrdinalIgnoreCase);
 
-            builder.AppendLine("Status: " + _status);
+            builder.AppendLine("Status: " + status);
             builder.AppendLine("Foreground process: " + (foreground.ProcessName ?? "unknown"));
             builder.AppendLine("Foreground title: " + (foreground.Title ?? ""));
-            builder.AppendLine("Current default render: " + CurrentDeviceName());
+            builder.AppendLine("Current default render: " + CurrentDeviceName(audio));
             builder.AppendLine();
 
             builder.AppendLine("Matching rules:");
-            foreach (var rule in _config.Rules)
+            foreach (var rule in config.Rules)
             {
                 if (rule.IsMatch(foreground, running))
                 {
@@ -2189,7 +2283,7 @@ namespace PrimaryAudioSwitcher
             builder.AppendLine();
 
             builder.AppendLine("Rules:");
-            foreach (var rule in _config.Rules)
+            foreach (var rule in config.Rules)
             {
                 builder.AppendLine("  " + rule);
             }
@@ -2198,7 +2292,7 @@ namespace PrimaryAudioSwitcher
             builder.AppendLine("Render devices:");
             try
             {
-                foreach (var device in _audio.ListRenderDevices())
+                foreach (var device in audio.ListRenderDevices())
                 {
                     builder.AppendLine("  " + device.Name);
                     builder.AppendLine("    " + device.Id);
@@ -2216,14 +2310,14 @@ namespace PrimaryAudioSwitcher
                 builder.AppendLine("  " + process);
             }
 
-            _text.Text = builder.ToString();
+            return builder.ToString();
         }
 
-        private string CurrentDeviceName()
+        private static string CurrentDeviceName(AudioDeviceManager audio)
         {
             try
             {
-                var current = _audio.GetDefaultRenderDevice();
+                var current = audio.GetDefaultRenderDevice();
                 return current == null ? "unknown" : current.Name;
             }
             catch

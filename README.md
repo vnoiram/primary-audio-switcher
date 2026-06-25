@@ -83,6 +83,11 @@ Settings are split into tabs:
 - Export or import a single rule as XML.
 - See currently matching rules highlighted with `>>` in the rule list.
 - Review recent switch history in the `Status` tab.
+- Validate rules from the `Rules` tab to catch missing processes, duplicate names, and missing devices.
+- Save a diagnostics report from the `Status` tab.
+- Clear switch history from the `Status` tab.
+- Open the config folder directly from the tray menu.
+- Open an `About` dialog from the tray menu.
 
 ## Config
 
