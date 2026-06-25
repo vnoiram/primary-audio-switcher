@@ -30,6 +30,7 @@ New-Item -ItemType Directory -Force -Path $outDir | Out-Null
     /reference:System.dll `
     /reference:System.Core.dll `
     /reference:System.Drawing.dll `
+    /reference:System.Management.dll `
     /reference:System.Windows.Forms.dll `
     /reference:System.Xml.Linq.dll `
     $src
