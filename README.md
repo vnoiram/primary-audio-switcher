@@ -48,6 +48,12 @@ Right-click the tray icon to reload or open the config.
 
 Use `Settings` from the tray menu to edit rules. For each rule you can:
 
+Settings are split into tabs:
+
+- `Rules`: rule list and per-rule matching/device behavior.
+- `Global`: fallback, exit behavior, polling, watchers, startup, pause, and notifications.
+- `Status`: current default render device and log access.
+
 - Select `Foreground app` or `Running process`.
 - Pick a process from the currently running process list.
 - Use `Browse exe` to select a local executable file.

@@ -1134,8 +1134,8 @@ namespace PrimaryAudioSwitcher
             Text = "Primary Audio Switcher Settings";
             StartPosition = FormStartPosition.CenterScreen;
             Width = 760;
-            Height = 680;
-            MinimumSize = new Size(720, 640);
+            Height = 560;
+            MinimumSize = new Size(720, 520);
 
             BuildUi();
             LoadDeviceList();
@@ -1150,15 +1150,53 @@ namespace PrimaryAudioSwitcher
             var root = new TableLayoutPanel
             {
                 Dock = DockStyle.Fill,
-                ColumnCount = 2,
+                ColumnCount = 1,
                 RowCount = 2,
                 Padding = new Padding(10)
             };
-            root.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 38));
-            root.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 62));
+            root.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
             root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
             root.RowStyles.Add(new RowStyle(SizeType.Absolute, 44));
             Controls.Add(root);
+
+            var tabs = new TabControl { Dock = DockStyle.Fill };
+            root.Controls.Add(tabs, 0, 0);
+
+            var rulesTab = new TabPage("Rules");
+            var globalTab = new TabPage("Global");
+            var statusTab = new TabPage("Status");
+            tabs.TabPages.Add(rulesTab);
+            tabs.TabPages.Add(globalTab);
+            tabs.TabPages.Add(statusTab);
+
+            BuildRulesTab(rulesTab);
+            BuildGlobalTab(globalTab);
+            BuildStatusTab(statusTab);
+
+            var bottom = new FlowLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                FlowDirection = FlowDirection.RightToLeft
+            };
+            var save = MakeButton("Save", SaveAndClose);
+            save.DialogResult = DialogResult.None;
+            bottom.Controls.Add(save);
+            bottom.Controls.Add(MakeButton("Cancel", delegate { DialogResult = DialogResult.Cancel; Close(); }));
+            root.Controls.Add(bottom, 0, 1);
+        }
+
+        private void BuildRulesTab(TabPage tab)
+        {
+            var root = new TableLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                ColumnCount = 2,
+                RowCount = 1,
+                Padding = new Padding(10)
+            };
+            root.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 36));
+            root.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 64));
+            tab.Controls.Add(root);
 
             _rules.Dock = DockStyle.Fill;
             _rules.SelectedIndexChanged += (sender, args) => LoadSelectedRule();
@@ -1169,15 +1207,15 @@ namespace PrimaryAudioSwitcher
             {
                 Dock = DockStyle.Fill,
                 ColumnCount = 3,
-                RowCount = 17,
+                RowCount = 11,
                 Padding = new Padding(10, 0, 0, 0)
             };
             editor.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 120));
             editor.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
             editor.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 120));
-            for (var i = 0; i < 17; i++)
+            for (var i = 0; i < 11; i++)
             {
-                editor.RowStyles.Add(new RowStyle(SizeType.Absolute, i == 15 ? 70 : 34));
+                editor.RowStyles.Add(new RowStyle(SizeType.Absolute, i == 9 ? 70 : 34));
             }
             root.Controls.Add(editor, 1, 0);
 
@@ -1220,76 +1258,22 @@ namespace PrimaryAudioSwitcher
             editor.SetColumnSpan(_alternateDevice, 2);
             _alternateDevice.Dock = DockStyle.Fill;
 
-            AddLabel(editor, "Fallback", 6);
-            _fallback.DropDownStyle = ComboBoxStyle.DropDown;
-            editor.Controls.Add(_fallback, 1, 6);
-            editor.SetColumnSpan(_fallback, 2);
-            _fallback.Dock = DockStyle.Fill;
-
-            AddLabel(editor, "On exit", 7);
-            _exitAction.DropDownStyle = ComboBoxStyle.DropDownList;
-            _exitAction.Items.Add("Fallback device");
-            _exitAction.Items.Add("Previous device");
-            _exitAction.Items.Add("Do nothing");
-            editor.Controls.Add(_exitAction, 1, 7);
-            _exitAction.Dock = DockStyle.Fill;
+            AddLabel(editor, "On exit delay", 6);
             _exitDelay.Minimum = 0;
             _exitDelay.Maximum = 60000;
             _exitDelay.Increment = 250;
-            editor.Controls.Add(_exitDelay, 2, 7);
+            editor.Controls.Add(_exitDelay, 1, 6);
+            editor.SetColumnSpan(_exitDelay, 2);
 
-            AddLabel(editor, "Poll ms", 8);
-            _poll.Minimum = 250;
-            _poll.Maximum = 60000;
-            _poll.Increment = 250;
-            editor.Controls.Add(_poll, 1, 8);
-            _log.Text = "Enable log";
-            _log.Dock = DockStyle.Fill;
-            editor.Controls.Add(_log, 2, 8);
-
-            AddLabel(editor, "Cooldown", 9);
-            _cooldown.Minimum = 0;
-            _cooldown.Maximum = 60000;
-            _cooldown.Increment = 250;
-            editor.Controls.Add(_cooldown, 1, 9);
-            editor.Controls.Add(MakeButton("View log", ViewLog), 2, 9);
-
-            AddLabel(editor, "Watchers", 10);
-            _processStartWatcher.Text = "Use WMI start event";
-            _processStartWatcher.Dock = DockStyle.Fill;
-            editor.Controls.Add(_processStartWatcher, 1, 10);
-            _deviceChangeWatcher.Text = "Device changes";
-            _deviceChangeWatcher.Dock = DockStyle.Fill;
-            editor.Controls.Add(_deviceChangeWatcher, 2, 10);
-
-            AddLabel(editor, "Rule retry", 11);
+            AddLabel(editor, "Rule retry", 7);
             _startRetryCount.Minimum = 0;
             _startRetryCount.Maximum = 20;
             _startRetryCount.Increment = 1;
-            editor.Controls.Add(_startRetryCount, 1, 11);
+            editor.Controls.Add(_startRetryCount, 1, 7);
             _startRetryDelay.Minimum = 100;
             _startRetryDelay.Maximum = 10000;
             _startRetryDelay.Increment = 100;
-            editor.Controls.Add(_startRetryDelay, 2, 11);
-
-            AddLabel(editor, "Startup", 12);
-            _startup.Text = "Start with Windows";
-            _startup.Dock = DockStyle.Fill;
-            editor.Controls.Add(_startup, 1, 12);
-            _notifications.Text = "Notifications";
-            _notifications.Dock = DockStyle.Fill;
-            editor.Controls.Add(_notifications, 2, 12);
-
-            AddLabel(editor, "Paused", 13);
-            _paused.Text = "Pause automation";
-            _paused.Dock = DockStyle.Fill;
-            editor.Controls.Add(_paused, 1, 13);
-
-            AddLabel(editor, "Current", 14);
-            _currentDevice.Dock = DockStyle.Fill;
-            _currentDevice.TextAlign = ContentAlignment.MiddleLeft;
-            editor.Controls.Add(_currentDevice, 1, 14);
-            editor.SetColumnSpan(_currentDevice, 2);
+            editor.Controls.Add(_startRetryDelay, 2, 7);
 
             var ruleButtons = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.LeftToRight };
             ruleButtons.Controls.Add(MakeButton("Add", AddRule));
@@ -1298,20 +1282,109 @@ namespace PrimaryAudioSwitcher
             ruleButtons.Controls.Add(MakeButton("Up", MoveRuleUp));
             ruleButtons.Controls.Add(MakeButton("Down", MoveRuleDown));
             ruleButtons.Controls.Add(MakeButton("Test", TestRule));
-            editor.Controls.Add(ruleButtons, 1, 15);
+            editor.Controls.Add(ruleButtons, 1, 9);
             editor.SetColumnSpan(ruleButtons, 2);
+        }
 
-            var bottom = new FlowLayoutPanel
+        private void BuildGlobalTab(TabPage tab)
+        {
+            var editor = new TableLayoutPanel
             {
                 Dock = DockStyle.Fill,
-                FlowDirection = FlowDirection.RightToLeft
+                ColumnCount = 3,
+                RowCount = 8,
+                Padding = new Padding(10)
             };
-            var save = MakeButton("Save", SaveAndClose);
-            save.DialogResult = DialogResult.None;
-            bottom.Controls.Add(save);
-            bottom.Controls.Add(MakeButton("Cancel", delegate { DialogResult = DialogResult.Cancel; Close(); }));
-            root.Controls.Add(bottom, 0, 1);
-            root.SetColumnSpan(bottom, 2);
+            editor.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 120));
+            editor.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+            editor.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 150));
+            for (var i = 0; i < 8; i++)
+            {
+                editor.RowStyles.Add(new RowStyle(SizeType.Absolute, 36));
+            }
+            tab.Controls.Add(editor);
+
+            AddLabel(editor, "Fallback", 0);
+            _fallback.DropDownStyle = ComboBoxStyle.DropDown;
+            editor.Controls.Add(_fallback, 1, 0);
+            editor.SetColumnSpan(_fallback, 2);
+            _fallback.Dock = DockStyle.Fill;
+
+            AddLabel(editor, "On exit", 1);
+            _exitAction.DropDownStyle = ComboBoxStyle.DropDownList;
+            _exitAction.Items.Add("Fallback device");
+            _exitAction.Items.Add("Previous device");
+            _exitAction.Items.Add("Do nothing");
+            editor.Controls.Add(_exitAction, 1, 1);
+            editor.SetColumnSpan(_exitAction, 2);
+            _exitAction.Dock = DockStyle.Fill;
+
+            AddLabel(editor, "Poll ms", 2);
+            _poll.Minimum = 250;
+            _poll.Maximum = 60000;
+            _poll.Increment = 250;
+            editor.Controls.Add(_poll, 1, 2);
+            _log.Text = "Enable log";
+            _log.Dock = DockStyle.Fill;
+            editor.Controls.Add(_log, 2, 2);
+
+            AddLabel(editor, "Cooldown", 3);
+            _cooldown.Minimum = 0;
+            _cooldown.Maximum = 60000;
+            _cooldown.Increment = 250;
+            editor.Controls.Add(_cooldown, 1, 3);
+
+            AddLabel(editor, "Watchers", 4);
+            _processStartWatcher.Text = "Process start";
+            _processStartWatcher.Dock = DockStyle.Fill;
+            editor.Controls.Add(_processStartWatcher, 1, 4);
+            _deviceChangeWatcher.Text = "Device changes";
+            _deviceChangeWatcher.Dock = DockStyle.Fill;
+            editor.Controls.Add(_deviceChangeWatcher, 2, 4);
+
+            AddLabel(editor, "Startup", 5);
+            _startup.Text = "Start with Windows";
+            _startup.Dock = DockStyle.Fill;
+            editor.Controls.Add(_startup, 1, 5);
+            _notifications.Text = "Notifications";
+            _notifications.Dock = DockStyle.Fill;
+            editor.Controls.Add(_notifications, 2, 5);
+
+            AddLabel(editor, "Paused", 6);
+            _paused.Text = "Pause automation";
+            _paused.Dock = DockStyle.Fill;
+            editor.Controls.Add(_paused, 1, 6);
+            editor.SetColumnSpan(_paused, 2);
+        }
+
+        private void BuildStatusTab(TabPage tab)
+        {
+            var editor = new TableLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                ColumnCount = 3,
+                RowCount = 3,
+                Padding = new Padding(10)
+            };
+            editor.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 120));
+            editor.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+            editor.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 150));
+            editor.RowStyles.Add(new RowStyle(SizeType.Absolute, 36));
+            editor.RowStyles.Add(new RowStyle(SizeType.Absolute, 40));
+            editor.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+            tab.Controls.Add(editor);
+
+            AddLabel(editor, "Current", 0);
+            _currentDevice.Dock = DockStyle.Fill;
+            _currentDevice.TextAlign = ContentAlignment.MiddleLeft;
+            editor.Controls.Add(_currentDevice, 1, 0);
+            editor.SetColumnSpan(_currentDevice, 2);
+
+            var buttons = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.LeftToRight };
+            buttons.Controls.Add(MakeButton("Refresh", RefreshLists));
+            buttons.Controls.Add(MakeButton("View log", ViewLog));
+            editor.Controls.Add(buttons, 1, 1);
+            editor.SetColumnSpan(buttons, 2);
         }
 
         private static void AddLabel(TableLayoutPanel panel, string text, int row)
