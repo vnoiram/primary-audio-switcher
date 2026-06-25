@@ -67,6 +67,11 @@ Use `Settings` from the tray menu to edit rules. For each rule you can:
 - Delay process-exit restore per rule.
 - Set a global switch cooldown to avoid rapid device changes while foreground apps change.
 - Open the built-in log viewer from the tray menu or settings window.
+- Match foreground rules by optional window title substring.
+- Enter multiple process names in one rule with `;`, for example `launcher;game`.
+- Open `Diagnostics` from the tray menu to inspect foreground process/title, active devices, running processes, and matching rules.
+- Restore the previous `config.xml.bak` from the tray menu.
+- Re-evaluate rules automatically when Windows reports device connection changes.
 
 ## Config
 
@@ -74,15 +79,17 @@ Example:
 
 ```xml
 <?xml version="1.0" encoding="utf-8"?>
-<PrimaryAudioSwitcher pollMilliseconds="1000" fallbackDevice="" fallbackDeviceId="" log="true" notifications="false" paused="false" processStartWatcher="true" switchCooldownMilliseconds="0" processExitAction="fallback">
-  <Rule name="Game foreground" enabled="true" foregroundProcess="Game.exe" device="Speakers" deviceId="" alternateDevice="" alternateDeviceId="" retryCount="3" retryDelayMilliseconds="500" exitDelayMilliseconds="0" />
-  <Rule name="Discord running" enabled="true" runningProcess="Discord.exe" device="Headset" deviceId="" alternateDevice="" alternateDeviceId="" retryCount="3" retryDelayMilliseconds="500" exitDelayMilliseconds="0" />
+<PrimaryAudioSwitcher pollMilliseconds="1000" fallbackDevice="" fallbackDeviceId="" log="true" notifications="false" paused="false" processStartWatcher="true" deviceChangeWatcher="true" switchCooldownMilliseconds="0" processExitAction="fallback">
+  <Rule name="Game foreground" enabled="true" foregroundProcess="Game.exe" windowTitle="" device="Speakers" deviceId="" alternateDevice="" alternateDeviceId="" retryCount="3" retryDelayMilliseconds="500" exitDelayMilliseconds="0" />
+  <Rule name="Discord running" enabled="true" runningProcess="Discord.exe" windowTitle="" device="Headset" deviceId="" alternateDevice="" alternateDeviceId="" retryCount="3" retryDelayMilliseconds="500" exitDelayMilliseconds="0" />
 </PrimaryAudioSwitcher>
 ```
 
 Rules are evaluated top to bottom. `foregroundProcess` has priority over `runningProcess` inside a rule. Process names may include or omit `.exe`.
 
 The settings window saves process names without `.exe`, which matches how Windows reports `Process.ProcessName`.
+
+Process fields accept multiple names separated by `;` or `,`. `windowTitle` is optional and only applies to foreground rules.
 
 `deviceId` is matched first. If it is empty or the endpoint no longer exists, `device` is matched by substring against active Windows render device friendly names or endpoint IDs. Use the tray menu item `Write device list to log`; it writes active render device names to:
 
@@ -95,6 +102,8 @@ If the primary device cannot be found, `alternateDeviceId` / `alternateDevice` i
 `fallbackDevice` is optional. If set, the app switches to it when no rule matches.
 
 When `processStartWatcher` is enabled, the app subscribes to `Win32_ProcessStartTrace` and `Win32_ProcessStopTrace` through WMI. This is not process injection; it only receives Windows process notifications. Start events apply only to `runningProcess` rules, then retry the same default-device change for apps that bind audio shortly after launch.
+
+When `deviceChangeWatcher` is enabled, the app subscribes to `Win32_DeviceChangeEvent` and re-runs rule evaluation after device connection changes.
 
 `processExitAction` supports:
 

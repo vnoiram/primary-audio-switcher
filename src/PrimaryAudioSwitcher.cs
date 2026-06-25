@@ -45,7 +45,8 @@ namespace PrimaryAudioSwitcher
         private readonly Control _uiThread = new Control();
         private ManagementEventWatcher _processStartWatcher;
         private ManagementEventWatcher _processStopWatcher;
-        private readonly Dictionary<string, string> _previousDeviceByProcess = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        private ManagementEventWatcher _deviceChangeWatcher;
+        private readonly Dictionary<string, string> _previousDeviceByRule = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         private AppConfig _config;
         private string _lastAppliedDeviceId;
         private string _lastStatus = "Starting";
@@ -79,7 +80,7 @@ namespace PrimaryAudioSwitcher
             _timer.Tick += (sender, eventArgs) => EvaluateRules();
             _timer.Start();
             _paused = _config.Paused;
-            StartProcessStartWatcher();
+            StartWatchers();
             EvaluateRules();
         }
 
@@ -94,9 +95,11 @@ namespace PrimaryAudioSwitcher
             menu.Items.Add("Reload config", null, (sender, args) => ReloadConfig());
             menu.Items.Add("Open config", null, (sender, args) => Process.Start("notepad.exe", _configPath));
             menu.Items.Add("View log", null, (sender, args) => ViewLog());
+            menu.Items.Add("Diagnostics", null, (sender, args) => ViewDiagnostics());
             menu.Items.Add("Write device list to log", null, (sender, args) => WriteDeviceList());
             menu.Items.Add("Export config", null, (sender, args) => ExportConfig());
             menu.Items.Add("Import config", null, (sender, args) => ImportConfig());
+            menu.Items.Add("Restore config backup", null, (sender, args) => RestoreConfigBackup());
             menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add("Exit", null, (sender, args) => ExitThread());
             return menu;
@@ -112,7 +115,8 @@ namespace PrimaryAudioSwitcher
                     return;
                 }
 
-                var foreground = ForegroundWindowReader.GetForegroundProcessName();
+                var foregroundInfo = ForegroundWindowReader.GetForegroundWindowInfo();
+                var foreground = foregroundInfo.ProcessName;
                 var running = new HashSet<string>(
                     Process.GetProcesses()
                         .Select(p => SafeProcessName(p))
@@ -121,7 +125,7 @@ namespace PrimaryAudioSwitcher
 
                 foreach (var rule in _config.Rules)
                 {
-                    if (!rule.IsMatch(foreground, running))
+                    if (!rule.IsMatch(foregroundInfo, running))
                     {
                         continue;
                     }
@@ -153,9 +157,9 @@ namespace PrimaryAudioSwitcher
                 if (current != null)
                 {
                     var process = rule.TargetProcess;
-                    if (!string.IsNullOrWhiteSpace(process))
+                    if (!string.IsNullOrWhiteSpace(process) && !_previousDeviceByRule.ContainsKey(rule.Name ?? ""))
                     {
-                        _previousDeviceByProcess[process] = current.Id;
+                        _previousDeviceByRule[rule.Name ?? ""] = current.Id;
                     }
                 }
             }
@@ -207,6 +211,12 @@ namespace PrimaryAudioSwitcher
             SetStatus("Rule: " + ruleName + " -> " + device.Name);
             ShowNotification("Audio device changed", device.Name + " (" + ruleName + ")");
             Log("Applied rule='" + ruleName + "' foreground='" + (foreground ?? "unknown") + "' device='" + device.Name + "'" + (force ? " force=true" : ""));
+        }
+
+        private void StartWatchers()
+        {
+            StartProcessStartWatcher();
+            StartDeviceChangeWatcher();
         }
 
         private void StartProcessStartWatcher()
@@ -265,6 +275,48 @@ namespace PrimaryAudioSwitcher
             {
                 watcher.Dispose();
                 watcher = null;
+            }
+        }
+
+        private void StartDeviceChangeWatcher()
+        {
+            StopWatcher(ref _deviceChangeWatcher, DeviceChangeWatcherOnEventArrived);
+            if (!_config.DeviceChangeWatcherEnabled)
+            {
+                return;
+            }
+
+            try
+            {
+                _deviceChangeWatcher = new ManagementEventWatcher(new WqlEventQuery("SELECT * FROM Win32_DeviceChangeEvent"));
+                _deviceChangeWatcher.EventArrived += DeviceChangeWatcherOnEventArrived;
+                _deviceChangeWatcher.Start();
+                Log("Device change watcher enabled");
+            }
+            catch (Exception ex)
+            {
+                Log("Device change watcher failed: " + ex);
+            }
+        }
+
+        private void DeviceChangeWatcherOnEventArrived(object sender, EventArrivedEventArgs args)
+        {
+            if (_uiThread.IsDisposed)
+            {
+                return;
+            }
+
+            try
+            {
+                _uiThread.BeginInvoke((MethodInvoker)delegate
+                {
+                    Log("Device change event received");
+                    _lastAppliedDeviceId = null;
+                    EvaluateRules();
+                });
+            }
+            catch
+            {
             }
         }
 
@@ -350,6 +402,13 @@ namespace PrimaryAudioSwitcher
                 return;
             }
 
+            if (matchingRules.Any(rule => rule.RunningProcesses.Any(process =>
+                    !string.Equals(process, normalized, StringComparison.OrdinalIgnoreCase) && IsProcessRunning(process))))
+            {
+                Log("Process stop ignored because related process is still running: " + normalized);
+                return;
+            }
+
             var delay = matchingRules.Max(rule => Math.Max(0, rule.ExitDelayMilliseconds));
             if (delay > 0)
             {
@@ -378,11 +437,24 @@ namespace PrimaryAudioSwitcher
         private void RestoreAfterProcessStop(string normalized)
         {
             string previousDeviceId;
-            if (_config.ProcessExitAction == ProcessExitAction.PreviousDevice &&
-                _previousDeviceByProcess.TryGetValue(normalized, out previousDeviceId))
+            AudioRule previousRule = null;
+            previousDeviceId = null;
+            if (_config.ProcessExitAction == ProcessExitAction.PreviousDevice)
+            {
+                foreach (var rule in _config.Rules)
+                {
+                    if (rule.MatchesRunningProcess(normalized) &&
+                        _previousDeviceByRule.TryGetValue(rule.Name ?? "", out previousDeviceId))
+                    {
+                        previousRule = rule;
+                        break;
+                    }
+                }
+            }
+            if (previousRule != null)
             {
                 ApplyDevice(previousDeviceId, null, "restore previous after " + normalized, normalized, true);
-                _previousDeviceByProcess.Remove(normalized);
+                _previousDeviceByRule.Remove(previousRule.Name ?? "");
                 return;
             }
 
@@ -426,7 +498,7 @@ namespace PrimaryAudioSwitcher
             {
                 _config = AppConfig.Load(_configPath);
                 _timer.Interval = Math.Max(250, _config.PollMilliseconds);
-                StartProcessStartWatcher();
+                StartWatchers();
                 _lastAppliedDeviceId = null;
                 _paused = _config.Paused;
                 SetStatus("Config reloaded");
@@ -451,7 +523,7 @@ namespace PrimaryAudioSwitcher
                 form.Config.Save(_configPath);
                 _config = form.Config;
                 _timer.Interval = Math.Max(250, _config.PollMilliseconds);
-                StartProcessStartWatcher();
+                StartWatchers();
                 _lastAppliedDeviceId = null;
                 _paused = _config.Paused;
                 SetStatus("Settings saved");
@@ -521,7 +593,7 @@ namespace PrimaryAudioSwitcher
                     _config = imported;
                     _timer.Interval = Math.Max(250, _config.PollMilliseconds);
                     _paused = _config.Paused;
-                    StartProcessStartWatcher();
+                    StartWatchers();
                     SetPauseMenuText();
                     SetStatus("Config imported");
                     EvaluateRules();
@@ -548,6 +620,40 @@ namespace PrimaryAudioSwitcher
             using (var form = new LogViewerForm(path))
             {
                 form.ShowDialog();
+            }
+        }
+
+        private void ViewDiagnostics()
+        {
+            using (var form = new DiagnosticsForm(_config, _audio, _lastStatus))
+            {
+                form.ShowDialog();
+            }
+        }
+
+        private void RestoreConfigBackup()
+        {
+            var backupPath = _configPath + ".bak";
+            if (!File.Exists(backupPath))
+            {
+                MessageBox.Show("Backup config was not found.", "Primary Audio Switcher", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+
+            try
+            {
+                File.Copy(backupPath, _configPath, true);
+                _config = AppConfig.Load(_configPath);
+                _paused = _config.Paused;
+                _timer.Interval = Math.Max(250, _config.PollMilliseconds);
+                StartWatchers();
+                SetStatus("Config backup restored");
+                EvaluateRules();
+            }
+            catch (Exception ex)
+            {
+                Log("Config backup restore failed: " + ex);
+                MessageBox.Show(ex.Message, "Primary Audio Switcher restore error", MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
         }
 
@@ -606,6 +712,7 @@ namespace PrimaryAudioSwitcher
         protected override void ExitThreadCore()
         {
             StopProcessStartWatcher();
+            StopWatcher(ref _deviceChangeWatcher, DeviceChangeWatcherOnEventArrived);
             _timer.Stop();
             _timer.Dispose();
             _notifyIcon.Visible = false;
@@ -677,6 +784,7 @@ namespace PrimaryAudioSwitcher
         public bool NotificationsEnabled { get; set; }
         public bool Paused { get; set; }
         public bool ProcessStartWatcherEnabled { get; set; }
+        public bool DeviceChangeWatcherEnabled { get; set; }
         public int SwitchCooldownMilliseconds { get; set; }
         public ProcessExitAction ProcessExitAction { get; set; }
         public List<AudioRule> Rules { get; set; }
@@ -704,6 +812,7 @@ namespace PrimaryAudioSwitcher
                 NotificationsEnabled = ((string)root.Attribute("notifications") ?? "false").Equals("true", StringComparison.OrdinalIgnoreCase),
                 Paused = ((string)root.Attribute("paused") ?? "false").Equals("true", StringComparison.OrdinalIgnoreCase),
                 ProcessStartWatcherEnabled = ((string)root.Attribute("processStartWatcher") ?? "true").Equals("true", StringComparison.OrdinalIgnoreCase),
+                DeviceChangeWatcherEnabled = ((string)root.Attribute("deviceChangeWatcher") ?? "true").Equals("true", StringComparison.OrdinalIgnoreCase),
                 SwitchCooldownMilliseconds = (int?)root.Attribute("switchCooldownMilliseconds") ?? 0,
                 ProcessExitAction = ProcessExitActions.Parse((string)root.Attribute("processExitAction")),
                 Rules = root.Elements("Rule")
@@ -725,6 +834,7 @@ namespace PrimaryAudioSwitcher
                 new XAttribute("notifications", NotificationsEnabled ? "true" : "false"),
                 new XAttribute("paused", Paused ? "true" : "false"),
                 new XAttribute("processStartWatcher", ProcessStartWatcherEnabled ? "true" : "false"),
+                new XAttribute("deviceChangeWatcher", DeviceChangeWatcherEnabled ? "true" : "false"),
                 new XAttribute("switchCooldownMilliseconds", SwitchCooldownMilliseconds),
                 new XAttribute("processExitAction", ProcessExitActions.ToConfigValue(ProcessExitAction)));
 
@@ -733,6 +843,7 @@ namespace PrimaryAudioSwitcher
                 var element = new XElement("Rule",
                     new XAttribute("name", rule.Name ?? ""),
                     new XAttribute("enabled", rule.Enabled ? "true" : "false"),
+                    new XAttribute("windowTitle", rule.WindowTitle ?? ""),
                     new XAttribute("device", rule.Device ?? ""),
                     new XAttribute("deviceId", rule.DeviceId ?? ""),
                     new XAttribute("alternateDevice", rule.AlternateDevice ?? ""),
@@ -754,6 +865,10 @@ namespace PrimaryAudioSwitcher
             }
 
             Directory.CreateDirectory(Path.GetDirectoryName(path));
+            if (File.Exists(path))
+            {
+                File.Copy(path, path + ".bak", true);
+            }
             new XDocument(new XDeclaration("1.0", "utf-8", "yes"), root).Save(path);
         }
 
@@ -768,6 +883,7 @@ namespace PrimaryAudioSwitcher
                 NotificationsEnabled = NotificationsEnabled,
                 Paused = Paused,
                 ProcessStartWatcherEnabled = ProcessStartWatcherEnabled,
+                DeviceChangeWatcherEnabled = DeviceChangeWatcherEnabled,
                 SwitchCooldownMilliseconds = SwitchCooldownMilliseconds,
                 ProcessExitAction = ProcessExitAction,
                 Rules = Rules.Select(r => r.Clone()).ToList()
@@ -776,10 +892,10 @@ namespace PrimaryAudioSwitcher
 
         public static readonly string DefaultXml =
 @"<?xml version=""1.0"" encoding=""utf-8""?>
-<PrimaryAudioSwitcher pollMilliseconds=""1000"" fallbackDevice="""" fallbackDeviceId="""" log=""true"" notifications=""false"" paused=""false"" processStartWatcher=""true"" switchCooldownMilliseconds=""0"" processExitAction=""fallback"">
+<PrimaryAudioSwitcher pollMilliseconds=""1000"" fallbackDevice="""" fallbackDeviceId="""" log=""true"" notifications=""false"" paused=""false"" processStartWatcher=""true"" deviceChangeWatcher=""true"" switchCooldownMilliseconds=""0"" processExitAction=""fallback"">
   <!-- device is matched by substring against active Windows render device friendly names. -->
-  <Rule name=""Game foreground"" enabled=""true"" foregroundProcess=""Game"" device=""Speakers"" deviceId="""" alternateDevice="""" alternateDeviceId="""" retryCount=""3"" retryDelayMilliseconds=""500"" exitDelayMilliseconds=""0"" />
-  <Rule name=""Discord running"" enabled=""true"" runningProcess=""Discord"" device=""Headset"" deviceId="""" alternateDevice="""" alternateDeviceId="""" retryCount=""3"" retryDelayMilliseconds=""500"" exitDelayMilliseconds=""0"" />
+  <Rule name=""Game foreground"" enabled=""true"" foregroundProcess=""Game"" windowTitle="""" device=""Speakers"" deviceId="""" alternateDevice="""" alternateDeviceId="""" retryCount=""3"" retryDelayMilliseconds=""500"" exitDelayMilliseconds=""0"" />
+  <Rule name=""Discord running"" enabled=""true"" runningProcess=""Discord"" windowTitle="""" device=""Headset"" deviceId="""" alternateDevice="""" alternateDeviceId="""" retryCount=""3"" retryDelayMilliseconds=""500"" exitDelayMilliseconds=""0"" />
 </PrimaryAudioSwitcher>
 ";
     }
@@ -829,6 +945,7 @@ namespace PrimaryAudioSwitcher
         public string Name { get; set; }
         public string ForegroundProcess { get; set; }
         public string RunningProcess { get; set; }
+        public string WindowTitle { get; set; }
         public bool Enabled { get; set; }
         public string Device { get; set; }
         public string DeviceId { get; set; }
@@ -853,16 +970,18 @@ namespace PrimaryAudioSwitcher
             }
         }
 
-        public bool IsMatch(string foregroundProcess, HashSet<string> runningProcesses)
+        public bool IsMatch(ForegroundWindowInfo foreground, HashSet<string> runningProcesses)
         {
             if (!string.IsNullOrWhiteSpace(ForegroundProcess))
             {
-                return Enabled && MatchesProcess(ForegroundProcess, foregroundProcess);
+                return Enabled &&
+                       MatchesAnyProcess(ForegroundProcess, foreground.ProcessName) &&
+                       MatchesWindowTitle(foreground.Title);
             }
 
             if (!string.IsNullOrWhiteSpace(RunningProcess))
             {
-                return Enabled && runningProcesses.Any(process => MatchesProcess(RunningProcess, process));
+                return Enabled && runningProcesses.Any(process => MatchesAnyProcess(RunningProcess, process));
             }
 
             return false;
@@ -870,7 +989,12 @@ namespace PrimaryAudioSwitcher
 
         public bool MatchesRunningProcess(string processName)
         {
-            return Enabled && !string.IsNullOrWhiteSpace(RunningProcess) && MatchesProcess(RunningProcess, processName);
+            return Enabled && !string.IsNullOrWhiteSpace(RunningProcess) && MatchesAnyProcess(RunningProcess, processName);
+        }
+
+        public IReadOnlyList<string> RunningProcesses
+        {
+            get { return SplitProcesses(RunningProcess); }
         }
 
         public static AudioRule FromXml(XElement element, int defaultRetryCount, int defaultRetryDelayMilliseconds)
@@ -888,6 +1012,7 @@ namespace PrimaryAudioSwitcher
                 Enabled = !(((string)element.Attribute("enabled") ?? "true").Equals("false", StringComparison.OrdinalIgnoreCase)),
                 ForegroundProcess = NormalizeProcess((string)element.Attribute("foregroundProcess")),
                 RunningProcess = NormalizeProcess((string)element.Attribute("runningProcess")),
+                WindowTitle = (string)element.Attribute("windowTitle"),
                 Device = device,
                 DeviceId = deviceId,
                 AlternateDevice = (string)element.Attribute("alternateDevice"),
@@ -906,6 +1031,7 @@ namespace PrimaryAudioSwitcher
                 Enabled = Enabled,
                 ForegroundProcess = ForegroundProcess,
                 RunningProcess = RunningProcess,
+                WindowTitle = WindowTitle,
                 Device = Device,
                 DeviceId = DeviceId,
                 AlternateDevice = AlternateDevice,
@@ -923,10 +1049,36 @@ namespace PrimaryAudioSwitcher
             return (Enabled ? "" : "[disabled] ") + (Name ?? "unnamed") + " [" + mode + ": " + (process ?? "") + "] -> " + (Device ?? "");
         }
 
+        private bool MatchesWindowTitle(string actualTitle)
+        {
+            return string.IsNullOrWhiteSpace(WindowTitle) ||
+                   (!string.IsNullOrWhiteSpace(actualTitle) &&
+                    actualTitle.IndexOf(WindowTitle, StringComparison.OrdinalIgnoreCase) >= 0);
+        }
+
+        private static bool MatchesAnyProcess(string expectedList, string actual)
+        {
+            return SplitProcesses(expectedList).Any(expected => MatchesProcess(expected, actual));
+        }
+
         private static bool MatchesProcess(string expected, string actual)
         {
             return !string.IsNullOrWhiteSpace(actual) &&
                    actual.Equals(NormalizeProcess(expected), StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static List<string> SplitProcesses(string value)
+        {
+            if (string.IsNullOrWhiteSpace(value))
+            {
+                return new List<string>();
+            }
+
+            return value.Split(new[] { ';', ',' }, StringSplitOptions.RemoveEmptyEntries)
+                .Select(NormalizeProcess)
+                .Where(process => !string.IsNullOrWhiteSpace(process))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
         }
 
         private static string NormalizeProcess(string value)
@@ -936,9 +1088,15 @@ namespace PrimaryAudioSwitcher
                 return null;
             }
 
-            return value.EndsWith(".exe", StringComparison.OrdinalIgnoreCase)
-                ? Path.GetFileNameWithoutExtension(value)
-                : value;
+            return string.Join(";", value.Split(new[] { ';', ',' }, StringSplitOptions.RemoveEmptyEntries)
+                .Select(item =>
+                {
+                    var trimmed = item.Trim();
+                    return trimmed.EndsWith(".exe", StringComparison.OrdinalIgnoreCase)
+                        ? Path.GetFileNameWithoutExtension(trimmed)
+                        : trimmed;
+                })
+                .Where(item => !string.IsNullOrWhiteSpace(item)));
         }
     }
 
@@ -949,6 +1107,7 @@ namespace PrimaryAudioSwitcher
         private readonly TextBox _name = new TextBox();
         private readonly ComboBox _mode = new ComboBox();
         private readonly ComboBox _process = new ComboBox();
+        private readonly TextBox _windowTitle = new TextBox();
         private readonly ComboBox _device = new ComboBox();
         private readonly ComboBox _alternateDevice = new ComboBox();
         private readonly ComboBox _fallback = new ComboBox();
@@ -960,6 +1119,7 @@ namespace PrimaryAudioSwitcher
         private readonly NumericUpDown _exitDelay = new NumericUpDown();
         private readonly CheckBox _log = new CheckBox();
         private readonly CheckBox _processStartWatcher = new CheckBox();
+        private readonly CheckBox _deviceChangeWatcher = new CheckBox();
         private readonly CheckBox _startup = new CheckBox();
         private readonly CheckBox _paused = new CheckBox();
         private readonly CheckBox _notifications = new CheckBox();
@@ -1009,15 +1169,15 @@ namespace PrimaryAudioSwitcher
             {
                 Dock = DockStyle.Fill,
                 ColumnCount = 3,
-                RowCount = 16,
+                RowCount = 17,
                 Padding = new Padding(10, 0, 0, 0)
             };
             editor.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 120));
             editor.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
             editor.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 120));
-            for (var i = 0; i < 16; i++)
+            for (var i = 0; i < 17; i++)
             {
-                editor.RowStyles.Add(new RowStyle(SizeType.Absolute, i == 14 ? 70 : 34));
+                editor.RowStyles.Add(new RowStyle(SizeType.Absolute, i == 15 ? 70 : 34));
             }
             root.Controls.Add(editor, 1, 0);
 
@@ -1043,82 +1203,92 @@ namespace PrimaryAudioSwitcher
             _process.Dock = DockStyle.Fill;
             editor.Controls.Add(MakeButton("Browse exe", BrowseProcessFile), 2, 2);
 
-            AddLabel(editor, "Audio device", 3);
-            _device.DropDownStyle = ComboBoxStyle.DropDown;
-            editor.Controls.Add(_device, 1, 3);
-            _device.Dock = DockStyle.Fill;
-            editor.Controls.Add(MakeButton("Refresh", RefreshLists), 2, 3);
+            AddLabel(editor, "Title contains", 3);
+            editor.Controls.Add(_windowTitle, 1, 3);
+            editor.SetColumnSpan(_windowTitle, 2);
+            _windowTitle.Dock = DockStyle.Fill;
 
-            AddLabel(editor, "Alt device", 4);
+            AddLabel(editor, "Audio device", 4);
+            _device.DropDownStyle = ComboBoxStyle.DropDown;
+            editor.Controls.Add(_device, 1, 4);
+            _device.Dock = DockStyle.Fill;
+            editor.Controls.Add(MakeButton("Refresh", RefreshLists), 2, 4);
+
+            AddLabel(editor, "Alt device", 5);
             _alternateDevice.DropDownStyle = ComboBoxStyle.DropDown;
-            editor.Controls.Add(_alternateDevice, 1, 4);
+            editor.Controls.Add(_alternateDevice, 1, 5);
             editor.SetColumnSpan(_alternateDevice, 2);
             _alternateDevice.Dock = DockStyle.Fill;
 
-            AddLabel(editor, "Fallback", 5);
+            AddLabel(editor, "Fallback", 6);
             _fallback.DropDownStyle = ComboBoxStyle.DropDown;
-            editor.Controls.Add(_fallback, 1, 5);
+            editor.Controls.Add(_fallback, 1, 6);
             editor.SetColumnSpan(_fallback, 2);
             _fallback.Dock = DockStyle.Fill;
 
-            AddLabel(editor, "On exit", 6);
+            AddLabel(editor, "On exit", 7);
             _exitAction.DropDownStyle = ComboBoxStyle.DropDownList;
             _exitAction.Items.Add("Fallback device");
             _exitAction.Items.Add("Previous device");
             _exitAction.Items.Add("Do nothing");
-            editor.Controls.Add(_exitAction, 1, 6);
+            editor.Controls.Add(_exitAction, 1, 7);
             _exitAction.Dock = DockStyle.Fill;
             _exitDelay.Minimum = 0;
             _exitDelay.Maximum = 60000;
             _exitDelay.Increment = 250;
-            editor.Controls.Add(_exitDelay, 2, 6);
+            editor.Controls.Add(_exitDelay, 2, 7);
 
-            AddLabel(editor, "Poll ms", 7);
+            AddLabel(editor, "Poll ms", 8);
             _poll.Minimum = 250;
             _poll.Maximum = 60000;
             _poll.Increment = 250;
-            editor.Controls.Add(_poll, 1, 7);
+            editor.Controls.Add(_poll, 1, 8);
             _log.Text = "Enable log";
             _log.Dock = DockStyle.Fill;
-            editor.Controls.Add(_log, 2, 7);
+            editor.Controls.Add(_log, 2, 8);
 
-            AddLabel(editor, "Cooldown", 8);
+            AddLabel(editor, "Cooldown", 9);
             _cooldown.Minimum = 0;
             _cooldown.Maximum = 60000;
             _cooldown.Increment = 250;
-            editor.Controls.Add(_cooldown, 1, 8);
-            editor.Controls.Add(MakeButton("View log", ViewLog), 2, 8);
+            editor.Controls.Add(_cooldown, 1, 9);
+            editor.Controls.Add(MakeButton("View log", ViewLog), 2, 9);
 
-            AddLabel(editor, "Process start", 9);
+            AddLabel(editor, "Watchers", 10);
             _processStartWatcher.Text = "Use WMI start event";
             _processStartWatcher.Dock = DockStyle.Fill;
-            editor.Controls.Add(_processStartWatcher, 1, 9);
-            _paused.Text = "Paused";
-            _paused.Dock = DockStyle.Fill;
-            editor.Controls.Add(_paused, 2, 9);
+            editor.Controls.Add(_processStartWatcher, 1, 10);
+            _deviceChangeWatcher.Text = "Device changes";
+            _deviceChangeWatcher.Dock = DockStyle.Fill;
+            editor.Controls.Add(_deviceChangeWatcher, 2, 10);
 
-            AddLabel(editor, "Rule retry", 10);
+            AddLabel(editor, "Rule retry", 11);
             _startRetryCount.Minimum = 0;
             _startRetryCount.Maximum = 20;
             _startRetryCount.Increment = 1;
-            editor.Controls.Add(_startRetryCount, 1, 10);
+            editor.Controls.Add(_startRetryCount, 1, 11);
             _startRetryDelay.Minimum = 100;
             _startRetryDelay.Maximum = 10000;
             _startRetryDelay.Increment = 100;
-            editor.Controls.Add(_startRetryDelay, 2, 10);
+            editor.Controls.Add(_startRetryDelay, 2, 11);
 
-            AddLabel(editor, "Startup", 11);
+            AddLabel(editor, "Startup", 12);
             _startup.Text = "Start with Windows";
             _startup.Dock = DockStyle.Fill;
-            editor.Controls.Add(_startup, 1, 11);
+            editor.Controls.Add(_startup, 1, 12);
             _notifications.Text = "Notifications";
             _notifications.Dock = DockStyle.Fill;
-            editor.Controls.Add(_notifications, 2, 11);
+            editor.Controls.Add(_notifications, 2, 12);
 
-            AddLabel(editor, "Current", 12);
+            AddLabel(editor, "Paused", 13);
+            _paused.Text = "Pause automation";
+            _paused.Dock = DockStyle.Fill;
+            editor.Controls.Add(_paused, 1, 13);
+
+            AddLabel(editor, "Current", 14);
             _currentDevice.Dock = DockStyle.Fill;
             _currentDevice.TextAlign = ContentAlignment.MiddleLeft;
-            editor.Controls.Add(_currentDevice, 1, 12);
+            editor.Controls.Add(_currentDevice, 1, 14);
             editor.SetColumnSpan(_currentDevice, 2);
 
             var ruleButtons = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.LeftToRight };
@@ -1128,7 +1298,7 @@ namespace PrimaryAudioSwitcher
             ruleButtons.Controls.Add(MakeButton("Up", MoveRuleUp));
             ruleButtons.Controls.Add(MakeButton("Down", MoveRuleDown));
             ruleButtons.Controls.Add(MakeButton("Test", TestRule));
-            editor.Controls.Add(ruleButtons, 1, 14);
+            editor.Controls.Add(ruleButtons, 1, 15);
             editor.SetColumnSpan(ruleButtons, 2);
 
             var bottom = new FlowLayoutPanel
@@ -1171,6 +1341,7 @@ namespace PrimaryAudioSwitcher
             _poll.Value = Math.Max(_poll.Minimum, Math.Min(_poll.Maximum, Config.PollMilliseconds));
             _cooldown.Value = Math.Max(_cooldown.Minimum, Math.Min(_cooldown.Maximum, Config.SwitchCooldownMilliseconds));
             _processStartWatcher.Checked = Config.ProcessStartWatcherEnabled;
+            _deviceChangeWatcher.Checked = Config.DeviceChangeWatcherEnabled;
             _paused.Checked = Config.Paused;
             _notifications.Checked = Config.NotificationsEnabled;
             _exitAction.SelectedIndex = Config.ProcessExitAction == ProcessExitAction.PreviousDevice
@@ -1260,7 +1431,10 @@ namespace PrimaryAudioSwitcher
                 dialog.Title = "Select application executable";
                 if (dialog.ShowDialog(this) == DialogResult.OK)
                 {
-                    _process.Text = Path.GetFileNameWithoutExtension(dialog.FileName);
+                    var selected = Path.GetFileNameWithoutExtension(dialog.FileName);
+                    _process.Text = string.IsNullOrWhiteSpace(_process.Text)
+                        ? selected
+                        : _process.Text.TrimEnd(';', ' ') + ";" + selected;
                 }
             }
         }
@@ -1371,6 +1545,7 @@ namespace PrimaryAudioSwitcher
             Config.NotificationsEnabled = _notifications.Checked;
             Config.Paused = _paused.Checked;
             Config.ProcessStartWatcherEnabled = _processStartWatcher.Checked;
+            Config.DeviceChangeWatcherEnabled = _deviceChangeWatcher.Checked;
             Config.ProcessExitAction = _exitAction.SelectedIndex == 1
                 ? ProcessExitAction.PreviousDevice
                 : _exitAction.SelectedIndex == 2 ? ProcessExitAction.None : ProcessExitAction.FallbackDevice;
@@ -1401,6 +1576,7 @@ namespace PrimaryAudioSwitcher
                 Enabled = _enabled.Checked,
                 ForegroundProcess = _mode.SelectedIndex == 0 ? processName : null,
                 RunningProcess = _mode.SelectedIndex == 1 ? processName : null,
+                WindowTitle = _windowTitle.Text.Trim(),
                 Device = device.Name,
                 DeviceId = device.Id,
                 AlternateDevice = alternateDevice.Name,
@@ -1421,6 +1597,7 @@ namespace PrimaryAudioSwitcher
             var rule = Config.Rules[_rules.SelectedIndex];
             _name.Text = rule.Name ?? "";
             _enabled.Checked = rule.Enabled;
+            _windowTitle.Text = rule.WindowTitle ?? "";
             if (!string.IsNullOrWhiteSpace(rule.ForegroundProcess))
             {
                 _mode.SelectedIndex = 0;
@@ -1624,6 +1801,157 @@ namespace PrimaryAudioSwitcher
         }
     }
 
+    internal sealed class DiagnosticsForm : Form
+    {
+        private readonly AppConfig _config;
+        private readonly AudioDeviceManager _audio;
+        private readonly string _status;
+        private readonly TextBox _text = new TextBox();
+
+        public DiagnosticsForm(AppConfig config, AudioDeviceManager audio, string status)
+        {
+            _config = config.Clone();
+            _audio = audio;
+            _status = status;
+            Text = "Primary Audio Switcher Diagnostics";
+            StartPosition = FormStartPosition.CenterParent;
+            Width = 900;
+            Height = 640;
+            MinimumSize = new Size(700, 420);
+            BuildUi();
+            RefreshDiagnostics();
+        }
+
+        private void BuildUi()
+        {
+            var root = new TableLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                RowCount = 2,
+                ColumnCount = 1,
+                Padding = new Padding(10)
+            };
+            root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+            root.RowStyles.Add(new RowStyle(SizeType.Absolute, 40));
+            Controls.Add(root);
+
+            _text.Dock = DockStyle.Fill;
+            _text.Multiline = true;
+            _text.ReadOnly = true;
+            _text.ScrollBars = ScrollBars.Both;
+            _text.WordWrap = false;
+            _text.Font = new Font(FontFamily.GenericMonospace, 9f);
+            root.Controls.Add(_text, 0, 0);
+
+            var buttons = new FlowLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                FlowDirection = FlowDirection.RightToLeft
+            };
+            buttons.Controls.Add(MakeButton("Close", delegate { Close(); }));
+            buttons.Controls.Add(MakeButton("Refresh", delegate { RefreshDiagnostics(); }));
+            root.Controls.Add(buttons, 0, 1);
+        }
+
+        private static Button MakeButton(string text, EventHandler handler)
+        {
+            var button = new Button
+            {
+                Text = text,
+                Width = 90,
+                Height = 28
+            };
+            button.Click += handler;
+            return button;
+        }
+
+        private void RefreshDiagnostics()
+        {
+            var builder = new StringBuilder();
+            var foreground = ForegroundWindowReader.GetForegroundWindowInfo();
+            var running = new HashSet<string>(
+                Process.GetProcesses()
+                    .Select(p => SafeProcessName(p))
+                    .Where(name => !string.IsNullOrWhiteSpace(name)),
+                StringComparer.OrdinalIgnoreCase);
+
+            builder.AppendLine("Status: " + _status);
+            builder.AppendLine("Foreground process: " + (foreground.ProcessName ?? "unknown"));
+            builder.AppendLine("Foreground title: " + (foreground.Title ?? ""));
+            builder.AppendLine("Current default render: " + CurrentDeviceName());
+            builder.AppendLine();
+
+            builder.AppendLine("Matching rules:");
+            foreach (var rule in _config.Rules)
+            {
+                if (rule.IsMatch(foreground, running))
+                {
+                    builder.AppendLine("  " + rule);
+                }
+            }
+            builder.AppendLine();
+
+            builder.AppendLine("Rules:");
+            foreach (var rule in _config.Rules)
+            {
+                builder.AppendLine("  " + rule);
+            }
+            builder.AppendLine();
+
+            builder.AppendLine("Render devices:");
+            try
+            {
+                foreach (var device in _audio.ListRenderDevices())
+                {
+                    builder.AppendLine("  " + device.Name);
+                    builder.AppendLine("    " + device.Id);
+                }
+            }
+            catch (Exception ex)
+            {
+                builder.AppendLine("  " + ex.Message);
+            }
+            builder.AppendLine();
+
+            builder.AppendLine("Running processes:");
+            foreach (var process in running.OrderBy(name => name, StringComparer.OrdinalIgnoreCase))
+            {
+                builder.AppendLine("  " + process);
+            }
+
+            _text.Text = builder.ToString();
+        }
+
+        private string CurrentDeviceName()
+        {
+            try
+            {
+                var current = _audio.GetDefaultRenderDevice();
+                return current == null ? "unknown" : current.Name;
+            }
+            catch
+            {
+                return "unknown";
+            }
+        }
+
+        private static string SafeProcessName(Process process)
+        {
+            try
+            {
+                return process.ProcessName;
+            }
+            catch
+            {
+                return null;
+            }
+            finally
+            {
+                process.Dispose();
+            }
+        }
+    }
+
     internal sealed class DeviceSelection
     {
         public DeviceSelection(string id, string name)
@@ -1671,30 +1999,48 @@ namespace PrimaryAudioSwitcher
     {
         public static string GetForegroundProcessName()
         {
+            return GetForegroundWindowInfo().ProcessName;
+        }
+
+        public static ForegroundWindowInfo GetForegroundWindowInfo()
+        {
             var hwnd = GetForegroundWindow();
             if (hwnd == IntPtr.Zero)
             {
-                return null;
+                return new ForegroundWindowInfo(null, null);
             }
 
             uint processId;
             GetWindowThreadProcessId(hwnd, out processId);
             if (processId == 0)
             {
-                return null;
+                return new ForegroundWindowInfo(null, ReadWindowTitle(hwnd));
             }
 
             try
             {
                 using (var process = Process.GetProcessById((int)processId))
                 {
-                    return process.ProcessName;
+                    return new ForegroundWindowInfo(process.ProcessName, ReadWindowTitle(hwnd));
                 }
             }
             catch
             {
-                return null;
+                return new ForegroundWindowInfo(null, ReadWindowTitle(hwnd));
             }
+        }
+
+        private static string ReadWindowTitle(IntPtr hwnd)
+        {
+            var length = GetWindowTextLength(hwnd);
+            if (length <= 0)
+            {
+                return "";
+            }
+
+            var builder = new StringBuilder(length + 1);
+            GetWindowText(hwnd, builder, builder.Capacity);
+            return builder.ToString();
         }
 
         [DllImport("user32.dll")]
@@ -1702,6 +2048,24 @@ namespace PrimaryAudioSwitcher
 
         [DllImport("user32.dll")]
         private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        private static extern int GetWindowText(IntPtr hWnd, StringBuilder text, int maxCount);
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        private static extern int GetWindowTextLength(IntPtr hWnd);
+    }
+
+    internal sealed class ForegroundWindowInfo
+    {
+        public ForegroundWindowInfo(string processName, string title)
+        {
+            ProcessName = processName;
+            Title = title;
+        }
+
+        public string ProcessName { get; private set; }
+        public string Title { get; private set; }
     }
 
     internal sealed class AudioDeviceManager
