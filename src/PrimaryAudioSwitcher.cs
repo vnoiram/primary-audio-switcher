@@ -129,6 +129,11 @@ namespace PrimaryAudioSwitcher
 
                 foreach (var rule in _config.Rules)
                 {
+                    if (!_config.IsRuleInActiveProfile(rule))
+                    {
+                        continue;
+                    }
+
                     if (!rule.IsMatch(foregroundInfo, running))
                     {
                         continue;
@@ -168,15 +173,18 @@ namespace PrimaryAudioSwitcher
                 }
             }
 
-            ApplyDevice(rule.DeviceId, rule.Device, rule.AlternateDeviceId, rule.AlternateDevice, rule.Name, foreground, force);
+            if (ApplyDevice(rule.DeviceId, rule.Device, rule.AlternateDeviceId, rule.AlternateDevice, rule.Name, foreground, force))
+            {
+                _audio.ApplySessionSettings(rule.TargetProcesses, rule.SessionVolumeEnabled, rule.SessionVolumePercent, rule.SessionMuteEnabled, rule.SessionMuted);
+            }
         }
 
-        private void ApplyDevice(string deviceId, string deviceMatch, string ruleName, string foreground, bool force)
+        private bool ApplyDevice(string deviceId, string deviceMatch, string ruleName, string foreground, bool force)
         {
-            ApplyDevice(deviceId, deviceMatch, null, null, ruleName, foreground, force);
+            return ApplyDevice(deviceId, deviceMatch, null, null, ruleName, foreground, force);
         }
 
-        private void ApplyDevice(string deviceId, string deviceMatch, string alternateDeviceId, string alternateDeviceMatch, string ruleName, string foreground, bool force)
+        private bool ApplyDevice(string deviceId, string deviceMatch, string alternateDeviceId, string alternateDeviceMatch, string ruleName, string foreground, bool force)
         {
             var device = _audio.FindRenderDevice(deviceId, deviceMatch);
             if (device == null)
@@ -194,28 +202,47 @@ namespace PrimaryAudioSwitcher
             {
                 SetStatus("Device not found: " + deviceMatch);
                 Log("Device not found for rule '" + ruleName + "': " + deviceMatch);
-                return;
+                ShowFailureNotification("Audio device not found", (deviceMatch ?? "unknown") + " (" + ruleName + ")");
+                return false;
             }
 
             if (!force && IsSwitchCooldownActive())
             {
                 SetStatus("Cooldown active. Current: " + CurrentDeviceName());
-                return;
+                return false;
             }
 
             if (!force && string.Equals(_lastAppliedDeviceId, device.Id, StringComparison.OrdinalIgnoreCase))
             {
                 SetStatus("Rule: " + ruleName + " -> " + device.Name);
-                return;
+                return true;
             }
 
-            _audio.SetDefaultRenderDevice(device.Id);
-            _lastAppliedDeviceId = device.Id;
-            _lastSwitchAt = DateTimeOffset.Now;
-            AddSwitchHistory(ruleName, device.Name, foreground, force);
-            SetStatus("Rule: " + ruleName + " -> " + device.Name);
-            ShowNotification("Audio device changed", device.Name + " (" + ruleName + ")");
-            Log("Applied rule='" + ruleName + "' foreground='" + (foreground ?? "unknown") + "' device='" + device.Name + "'" + (force ? " force=true" : ""));
+            if (!_config.AnyOutputRoleEnabled)
+            {
+                SetStatus("No output roles enabled");
+                ShowFailureNotification("Audio switch skipped", "No output roles are enabled.");
+                return false;
+            }
+
+            try
+            {
+                _audio.SetDefaultRenderDevice(device.Id, _config.RoleConsole, _config.RoleMultimedia, _config.RoleCommunications);
+                _lastAppliedDeviceId = device.Id;
+                _lastSwitchAt = DateTimeOffset.Now;
+                AddSwitchHistory(ruleName, device.Name, foreground, force);
+                SetStatus("Rule: " + ruleName + " -> " + device.Name);
+                ShowNotification("Audio device changed", device.Name + " (" + ruleName + ")");
+                Log("Applied rule='" + ruleName + "' foreground='" + (foreground ?? "unknown") + "' device='" + device.Name + "'" + (force ? " force=true" : ""));
+                return true;
+            }
+            catch (Exception ex)
+            {
+                SetStatus("Switch failed: " + ex.Message);
+                Log("Switch failed for rule '" + ruleName + "': " + ex);
+                ShowFailureNotification("Audio switch failed", device.Name + " (" + ruleName + ")");
+                return false;
+            }
         }
 
         private void StartWatchers()
@@ -376,6 +403,11 @@ namespace PrimaryAudioSwitcher
 
             foreach (var rule in _config.Rules)
             {
+                if (!_config.IsRuleInActiveProfile(rule))
+                {
+                    continue;
+                }
+
                 if (!rule.MatchesRunningProcess(normalized))
                 {
                     continue;
@@ -401,7 +433,9 @@ namespace PrimaryAudioSwitcher
                 return;
             }
 
-            var matchingRules = _config.Rules.Where(rule => rule.MatchesRunningProcess(normalized)).ToList();
+            var matchingRules = _config.Rules
+                .Where(rule => _config.IsRuleInActiveProfile(rule) && rule.MatchesRunningProcess(normalized))
+                .ToList();
             if (matchingRules.Count == 0)
             {
                 return;
@@ -711,6 +745,18 @@ namespace PrimaryAudioSwitcher
             _notifyIcon.ShowBalloonTip(2000);
         }
 
+        private void ShowFailureNotification(string title, string text)
+        {
+            if (!_config.NotifyFailures)
+            {
+                return;
+            }
+
+            _notifyIcon.BalloonTipTitle = title;
+            _notifyIcon.BalloonTipText = text;
+            _notifyIcon.ShowBalloonTip(3000);
+        }
+
         private void AddSwitchHistory(string ruleName, string deviceName, string trigger, bool forced)
         {
             _switchHistory.Insert(0, new SwitchHistoryItem(DateTimeOffset.Now, ruleName, deviceName, trigger, forced));
@@ -811,6 +857,11 @@ namespace PrimaryAudioSwitcher
         public bool Paused { get; set; }
         public bool ProcessStartWatcherEnabled { get; set; }
         public bool DeviceChangeWatcherEnabled { get; set; }
+        public bool NotifyFailures { get; set; }
+        public bool RoleConsole { get; set; }
+        public bool RoleMultimedia { get; set; }
+        public bool RoleCommunications { get; set; }
+        public string ActiveProfile { get; set; }
         public int SwitchCooldownMilliseconds { get; set; }
         public ProcessExitAction ProcessExitAction { get; set; }
         public List<AudioRule> Rules { get; set; }
@@ -818,6 +869,19 @@ namespace PrimaryAudioSwitcher
         public bool HasFallbackDevice
         {
             get { return !string.IsNullOrWhiteSpace(FallbackDevice) || !string.IsNullOrWhiteSpace(FallbackDeviceId); }
+        }
+
+        public bool AnyOutputRoleEnabled
+        {
+            get { return RoleConsole || RoleMultimedia || RoleCommunications; }
+        }
+
+        public bool IsRuleInActiveProfile(AudioRule rule)
+        {
+            var active = string.IsNullOrWhiteSpace(ActiveProfile) ? "Default" : ActiveProfile;
+            var profile = string.IsNullOrWhiteSpace(rule.Profile) ? "Default" : rule.Profile;
+            return active.Equals("All", StringComparison.OrdinalIgnoreCase) ||
+                   profile.Equals(active, StringComparison.OrdinalIgnoreCase);
         }
 
         public static AppConfig Load(string path)
@@ -839,6 +903,11 @@ namespace PrimaryAudioSwitcher
                 Paused = ((string)root.Attribute("paused") ?? "false").Equals("true", StringComparison.OrdinalIgnoreCase),
                 ProcessStartWatcherEnabled = ((string)root.Attribute("processStartWatcher") ?? "true").Equals("true", StringComparison.OrdinalIgnoreCase),
                 DeviceChangeWatcherEnabled = ((string)root.Attribute("deviceChangeWatcher") ?? "true").Equals("true", StringComparison.OrdinalIgnoreCase),
+                NotifyFailures = ((string)root.Attribute("notifyFailures") ?? "true").Equals("true", StringComparison.OrdinalIgnoreCase),
+                RoleConsole = ((string)root.Attribute("roleConsole") ?? "true").Equals("true", StringComparison.OrdinalIgnoreCase),
+                RoleMultimedia = ((string)root.Attribute("roleMultimedia") ?? "true").Equals("true", StringComparison.OrdinalIgnoreCase),
+                RoleCommunications = ((string)root.Attribute("roleCommunications") ?? "true").Equals("true", StringComparison.OrdinalIgnoreCase),
+                ActiveProfile = (string)root.Attribute("activeProfile") ?? "Default",
                 SwitchCooldownMilliseconds = (int?)root.Attribute("switchCooldownMilliseconds") ?? 0,
                 ProcessExitAction = ProcessExitActions.Parse((string)root.Attribute("processExitAction")),
                 Rules = root.Elements("Rule")
@@ -861,6 +930,11 @@ namespace PrimaryAudioSwitcher
                 new XAttribute("paused", Paused ? "true" : "false"),
                 new XAttribute("processStartWatcher", ProcessStartWatcherEnabled ? "true" : "false"),
                 new XAttribute("deviceChangeWatcher", DeviceChangeWatcherEnabled ? "true" : "false"),
+                new XAttribute("notifyFailures", NotifyFailures ? "true" : "false"),
+                new XAttribute("roleConsole", RoleConsole ? "true" : "false"),
+                new XAttribute("roleMultimedia", RoleMultimedia ? "true" : "false"),
+                new XAttribute("roleCommunications", RoleCommunications ? "true" : "false"),
+                new XAttribute("activeProfile", ActiveProfile ?? "Default"),
                 new XAttribute("switchCooldownMilliseconds", SwitchCooldownMilliseconds),
                 new XAttribute("processExitAction", ProcessExitActions.ToConfigValue(ProcessExitAction)));
 
@@ -868,6 +942,7 @@ namespace PrimaryAudioSwitcher
             {
                 var element = new XElement("Rule",
                     new XAttribute("name", rule.Name ?? ""),
+                    new XAttribute("profile", rule.Profile ?? "Default"),
                     new XAttribute("enabled", rule.Enabled ? "true" : "false"),
                     new XAttribute("windowTitle", rule.WindowTitle ?? ""),
                     new XAttribute("device", rule.Device ?? ""),
@@ -876,7 +951,11 @@ namespace PrimaryAudioSwitcher
                     new XAttribute("alternateDeviceId", rule.AlternateDeviceId ?? ""),
                     new XAttribute("retryCount", rule.RetryCount),
                     new XAttribute("retryDelayMilliseconds", rule.RetryDelayMilliseconds),
-                    new XAttribute("exitDelayMilliseconds", rule.ExitDelayMilliseconds));
+                    new XAttribute("exitDelayMilliseconds", rule.ExitDelayMilliseconds),
+                    new XAttribute("sessionVolumeEnabled", rule.SessionVolumeEnabled ? "true" : "false"),
+                    new XAttribute("sessionVolumePercent", rule.SessionVolumePercent),
+                    new XAttribute("sessionMuteEnabled", rule.SessionMuteEnabled ? "true" : "false"),
+                    new XAttribute("sessionMuted", rule.SessionMuted ? "true" : "false"));
 
                 if (!string.IsNullOrWhiteSpace(rule.ForegroundProcess))
                 {
@@ -910,6 +989,11 @@ namespace PrimaryAudioSwitcher
                 Paused = Paused,
                 ProcessStartWatcherEnabled = ProcessStartWatcherEnabled,
                 DeviceChangeWatcherEnabled = DeviceChangeWatcherEnabled,
+                NotifyFailures = NotifyFailures,
+                RoleConsole = RoleConsole,
+                RoleMultimedia = RoleMultimedia,
+                RoleCommunications = RoleCommunications,
+                ActiveProfile = ActiveProfile,
                 SwitchCooldownMilliseconds = SwitchCooldownMilliseconds,
                 ProcessExitAction = ProcessExitAction,
                 Rules = Rules.Select(r => r.Clone()).ToList()
@@ -918,10 +1002,10 @@ namespace PrimaryAudioSwitcher
 
         public static readonly string DefaultXml =
 @"<?xml version=""1.0"" encoding=""utf-8""?>
-<PrimaryAudioSwitcher pollMilliseconds=""1000"" fallbackDevice="""" fallbackDeviceId="""" log=""true"" notifications=""false"" paused=""false"" processStartWatcher=""true"" deviceChangeWatcher=""true"" switchCooldownMilliseconds=""0"" processExitAction=""fallback"">
+<PrimaryAudioSwitcher pollMilliseconds=""1000"" fallbackDevice="""" fallbackDeviceId="""" log=""true"" notifications=""false"" notifyFailures=""true"" paused=""false"" processStartWatcher=""true"" deviceChangeWatcher=""true"" roleConsole=""true"" roleMultimedia=""true"" roleCommunications=""true"" activeProfile=""Default"" switchCooldownMilliseconds=""0"" processExitAction=""fallback"">
   <!-- device is matched by substring against active Windows render device friendly names. -->
-  <Rule name=""Game foreground"" enabled=""true"" foregroundProcess=""Game"" windowTitle="""" device=""Speakers"" deviceId="""" alternateDevice="""" alternateDeviceId="""" retryCount=""3"" retryDelayMilliseconds=""500"" exitDelayMilliseconds=""0"" />
-  <Rule name=""Discord running"" enabled=""true"" runningProcess=""Discord"" windowTitle="""" device=""Headset"" deviceId="""" alternateDevice="""" alternateDeviceId="""" retryCount=""3"" retryDelayMilliseconds=""500"" exitDelayMilliseconds=""0"" />
+  <Rule name=""Game foreground"" profile=""Default"" enabled=""true"" foregroundProcess=""Game"" windowTitle="""" device=""Speakers"" deviceId="""" alternateDevice="""" alternateDeviceId="""" retryCount=""3"" retryDelayMilliseconds=""500"" exitDelayMilliseconds=""0"" sessionVolumeEnabled=""false"" sessionVolumePercent=""100"" sessionMuteEnabled=""false"" sessionMuted=""false"" />
+  <Rule name=""Discord running"" profile=""Default"" enabled=""true"" runningProcess=""Discord"" windowTitle="""" device=""Headset"" deviceId="""" alternateDevice="""" alternateDeviceId="""" retryCount=""3"" retryDelayMilliseconds=""500"" exitDelayMilliseconds=""0"" sessionVolumeEnabled=""false"" sessionVolumePercent=""100"" sessionMuteEnabled=""false"" sessionMuted=""false"" />
 </PrimaryAudioSwitcher>
 ";
     }
@@ -991,6 +1075,7 @@ namespace PrimaryAudioSwitcher
     internal sealed class AudioRule
     {
         public string Name { get; set; }
+        public string Profile { get; set; }
         public string ForegroundProcess { get; set; }
         public string RunningProcess { get; set; }
         public string WindowTitle { get; set; }
@@ -1002,6 +1087,10 @@ namespace PrimaryAudioSwitcher
         public int RetryCount { get; set; }
         public int RetryDelayMilliseconds { get; set; }
         public int ExitDelayMilliseconds { get; set; }
+        public bool SessionVolumeEnabled { get; set; }
+        public int SessionVolumePercent { get; set; }
+        public bool SessionMuteEnabled { get; set; }
+        public bool SessionMuted { get; set; }
 
         public bool HasAlternateDevice
         {
@@ -1045,6 +1134,11 @@ namespace PrimaryAudioSwitcher
             get { return SplitProcesses(RunningProcess); }
         }
 
+        public IReadOnlyList<string> TargetProcesses
+        {
+            get { return SplitProcesses(TargetProcess); }
+        }
+
         public static AudioRule FromXml(XElement element, int defaultRetryCount, int defaultRetryDelayMilliseconds)
         {
             var device = (string)element.Attribute("device");
@@ -1057,6 +1151,7 @@ namespace PrimaryAudioSwitcher
             return new AudioRule
             {
                 Name = (string)element.Attribute("name") ?? "unnamed",
+                Profile = (string)element.Attribute("profile") ?? "Default",
                 Enabled = !(((string)element.Attribute("enabled") ?? "true").Equals("false", StringComparison.OrdinalIgnoreCase)),
                 ForegroundProcess = NormalizeProcess((string)element.Attribute("foregroundProcess")),
                 RunningProcess = NormalizeProcess((string)element.Attribute("runningProcess")),
@@ -1067,7 +1162,11 @@ namespace PrimaryAudioSwitcher
                 AlternateDeviceId = (string)element.Attribute("alternateDeviceId"),
                 RetryCount = (int?)element.Attribute("retryCount") ?? defaultRetryCount,
                 RetryDelayMilliseconds = (int?)element.Attribute("retryDelayMilliseconds") ?? defaultRetryDelayMilliseconds,
-                ExitDelayMilliseconds = (int?)element.Attribute("exitDelayMilliseconds") ?? 0
+                ExitDelayMilliseconds = (int?)element.Attribute("exitDelayMilliseconds") ?? 0,
+                SessionVolumeEnabled = ((string)element.Attribute("sessionVolumeEnabled") ?? "false").Equals("true", StringComparison.OrdinalIgnoreCase),
+                SessionVolumePercent = (int?)element.Attribute("sessionVolumePercent") ?? 100,
+                SessionMuteEnabled = ((string)element.Attribute("sessionMuteEnabled") ?? "false").Equals("true", StringComparison.OrdinalIgnoreCase),
+                SessionMuted = ((string)element.Attribute("sessionMuted") ?? "false").Equals("true", StringComparison.OrdinalIgnoreCase)
             };
         }
 
@@ -1076,6 +1175,7 @@ namespace PrimaryAudioSwitcher
             return new AudioRule
             {
                 Name = Name,
+                Profile = Profile,
                 Enabled = Enabled,
                 ForegroundProcess = ForegroundProcess,
                 RunningProcess = RunningProcess,
@@ -1086,7 +1186,11 @@ namespace PrimaryAudioSwitcher
                 AlternateDeviceId = AlternateDeviceId,
                 RetryCount = RetryCount,
                 RetryDelayMilliseconds = RetryDelayMilliseconds,
-                ExitDelayMilliseconds = ExitDelayMilliseconds
+                ExitDelayMilliseconds = ExitDelayMilliseconds,
+                SessionVolumeEnabled = SessionVolumeEnabled,
+                SessionVolumePercent = SessionVolumePercent,
+                SessionMuteEnabled = SessionMuteEnabled,
+                SessionMuted = SessionMuted
             };
         }
 
@@ -1094,6 +1198,7 @@ namespace PrimaryAudioSwitcher
         {
             var element = new XElement("Rule",
                 new XAttribute("name", Name ?? ""),
+                new XAttribute("profile", Profile ?? "Default"),
                 new XAttribute("enabled", Enabled ? "true" : "false"),
                 new XAttribute("windowTitle", WindowTitle ?? ""),
                 new XAttribute("device", Device ?? ""),
@@ -1102,7 +1207,11 @@ namespace PrimaryAudioSwitcher
                 new XAttribute("alternateDeviceId", AlternateDeviceId ?? ""),
                 new XAttribute("retryCount", RetryCount),
                 new XAttribute("retryDelayMilliseconds", RetryDelayMilliseconds),
-                new XAttribute("exitDelayMilliseconds", ExitDelayMilliseconds));
+                new XAttribute("exitDelayMilliseconds", ExitDelayMilliseconds),
+                new XAttribute("sessionVolumeEnabled", SessionVolumeEnabled ? "true" : "false"),
+                new XAttribute("sessionVolumePercent", SessionVolumePercent),
+                new XAttribute("sessionMuteEnabled", SessionMuteEnabled ? "true" : "false"),
+                new XAttribute("sessionMuted", SessionMuted ? "true" : "false"));
 
             if (!string.IsNullOrWhiteSpace(ForegroundProcess))
             {
@@ -1204,8 +1313,13 @@ namespace PrimaryAudioSwitcher
     internal sealed class SettingsForm : Form
     {
         private readonly AudioDeviceManager _audio;
+        private AppConfig _originalConfig;
         private readonly ListBox _rules = new ListBox();
+        private readonly List<int> _visibleRuleIndexes = new List<int>();
         private readonly TextBox _name = new TextBox();
+        private readonly TextBox _profile = new TextBox();
+        private readonly ComboBox _activeProfile = new ComboBox();
+        private readonly TextBox _ruleFilter = new TextBox();
         private readonly ComboBox _mode = new ComboBox();
         private readonly ComboBox _process = new ComboBox();
         private readonly TextBox _windowTitle = new TextBox();
@@ -1221,10 +1335,18 @@ namespace PrimaryAudioSwitcher
         private readonly CheckBox _log = new CheckBox();
         private readonly CheckBox _processStartWatcher = new CheckBox();
         private readonly CheckBox _deviceChangeWatcher = new CheckBox();
+        private readonly CheckBox _notifyFailures = new CheckBox();
+        private readonly CheckBox _roleConsole = new CheckBox();
+        private readonly CheckBox _roleMultimedia = new CheckBox();
+        private readonly CheckBox _roleCommunications = new CheckBox();
         private readonly CheckBox _startup = new CheckBox();
         private readonly CheckBox _paused = new CheckBox();
         private readonly CheckBox _notifications = new CheckBox();
         private readonly CheckBox _enabled = new CheckBox();
+        private readonly CheckBox _sessionVolumeEnabled = new CheckBox();
+        private readonly NumericUpDown _sessionVolume = new NumericUpDown();
+        private readonly CheckBox _sessionMuteEnabled = new CheckBox();
+        private readonly CheckBox _sessionMuted = new CheckBox();
         private readonly Label _currentDevice = new Label();
         private readonly Label _matchingRules = new Label();
         private readonly ListBox _history = new ListBox();
@@ -1235,6 +1357,7 @@ namespace PrimaryAudioSwitcher
             _audio = audio;
             _switchHistory = switchHistory;
             Config = config.Clone();
+            _originalConfig = config.Clone();
 
             Text = "Primary Audio Switcher Settings";
             StartPosition = FormStartPosition.CenterScreen;
@@ -1303,24 +1426,36 @@ namespace PrimaryAudioSwitcher
             root.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 64));
             tab.Controls.Add(root);
 
+            var listPanel = new TableLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                RowCount = 2,
+                ColumnCount = 1
+            };
+            listPanel.RowStyles.Add(new RowStyle(SizeType.Absolute, 30));
+            listPanel.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+            root.Controls.Add(listPanel, 0, 0);
+            _ruleFilter.Dock = DockStyle.Fill;
+            _ruleFilter.TextChanged += delegate { ReloadRuleList(); };
+            listPanel.Controls.Add(_ruleFilter, 0, 0);
             _rules.Dock = DockStyle.Fill;
             _rules.SelectedIndexChanged += (sender, args) => LoadSelectedRule();
-            root.Controls.Add(_rules, 0, 0);
+            listPanel.Controls.Add(_rules, 0, 1);
             _enabled.Checked = true;
 
             var editor = new TableLayoutPanel
             {
                 Dock = DockStyle.Fill,
                 ColumnCount = 3,
-                RowCount = 11,
+                RowCount = 13,
                 Padding = new Padding(10, 0, 0, 0)
             };
             editor.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 120));
             editor.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
             editor.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 120));
-            for (var i = 0; i < 11; i++)
+            for (var i = 0; i < 13; i++)
             {
-                editor.RowStyles.Add(new RowStyle(SizeType.Absolute, i == 9 ? 70 : 34));
+                editor.RowStyles.Add(new RowStyle(SizeType.Absolute, i == 11 ? 70 : 34));
             }
             root.Controls.Add(editor, 1, 0);
 
@@ -1331,54 +1466,75 @@ namespace PrimaryAudioSwitcher
             _enabled.Dock = DockStyle.Fill;
             editor.Controls.Add(_enabled, 2, 0);
 
-            AddLabel(editor, "Match type", 1);
+            AddLabel(editor, "Profile", 1);
+            editor.Controls.Add(_profile, 1, 1);
+            editor.SetColumnSpan(_profile, 2);
+            _profile.Dock = DockStyle.Fill;
+
+            AddLabel(editor, "Match type", 2);
             _mode.DropDownStyle = ComboBoxStyle.DropDownList;
             _mode.Items.Add("Foreground app");
             _mode.Items.Add("Running process");
             _mode.SelectedIndex = 0;
-            editor.Controls.Add(_mode, 1, 1);
+            editor.Controls.Add(_mode, 1, 2);
             editor.SetColumnSpan(_mode, 2);
             _mode.Dock = DockStyle.Fill;
 
-            AddLabel(editor, "Process", 2);
+            AddLabel(editor, "Process", 3);
             _process.DropDownStyle = ComboBoxStyle.DropDown;
-            editor.Controls.Add(_process, 1, 2);
+            editor.Controls.Add(_process, 1, 3);
             _process.Dock = DockStyle.Fill;
-            editor.Controls.Add(MakeButton("Browse exe", BrowseProcessFile), 2, 2);
+            editor.Controls.Add(MakeButton("Browse exe", BrowseProcessFile), 2, 3);
 
-            AddLabel(editor, "Title contains", 3);
-            editor.Controls.Add(_windowTitle, 1, 3);
+            AddLabel(editor, "Title contains", 4);
+            editor.Controls.Add(_windowTitle, 1, 4);
             editor.SetColumnSpan(_windowTitle, 2);
             _windowTitle.Dock = DockStyle.Fill;
 
-            AddLabel(editor, "Audio device", 4);
+            AddLabel(editor, "Audio device", 5);
             _device.DropDownStyle = ComboBoxStyle.DropDown;
-            editor.Controls.Add(_device, 1, 4);
+            editor.Controls.Add(_device, 1, 5);
             _device.Dock = DockStyle.Fill;
-            editor.Controls.Add(MakeButton("Refresh", RefreshLists), 2, 4);
+            editor.Controls.Add(MakeButton("Refresh", RefreshLists), 2, 5);
 
-            AddLabel(editor, "Alt device", 5);
+            AddLabel(editor, "Alt device", 6);
             _alternateDevice.DropDownStyle = ComboBoxStyle.DropDown;
-            editor.Controls.Add(_alternateDevice, 1, 5);
+            editor.Controls.Add(_alternateDevice, 1, 6);
             editor.SetColumnSpan(_alternateDevice, 2);
             _alternateDevice.Dock = DockStyle.Fill;
 
-            AddLabel(editor, "On exit delay", 6);
+            AddLabel(editor, "On exit delay", 7);
             _exitDelay.Minimum = 0;
             _exitDelay.Maximum = 60000;
             _exitDelay.Increment = 250;
-            editor.Controls.Add(_exitDelay, 1, 6);
+            editor.Controls.Add(_exitDelay, 1, 7);
             editor.SetColumnSpan(_exitDelay, 2);
 
-            AddLabel(editor, "Rule retry", 7);
+            AddLabel(editor, "Rule retry", 8);
             _startRetryCount.Minimum = 0;
             _startRetryCount.Maximum = 20;
             _startRetryCount.Increment = 1;
-            editor.Controls.Add(_startRetryCount, 1, 7);
+            editor.Controls.Add(_startRetryCount, 1, 8);
             _startRetryDelay.Minimum = 100;
             _startRetryDelay.Maximum = 10000;
             _startRetryDelay.Increment = 100;
-            editor.Controls.Add(_startRetryDelay, 2, 7);
+            editor.Controls.Add(_startRetryDelay, 2, 8);
+
+            AddLabel(editor, "Session", 9);
+            _sessionVolumeEnabled.Text = "Volume";
+            _sessionVolumeEnabled.Dock = DockStyle.Left;
+            _sessionVolume.Minimum = 0;
+            _sessionVolume.Maximum = 100;
+            _sessionVolume.Value = 100;
+            var sessionPanel = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.LeftToRight };
+            sessionPanel.Controls.Add(_sessionVolumeEnabled);
+            sessionPanel.Controls.Add(_sessionVolume);
+            _sessionMuteEnabled.Text = "Mute";
+            sessionPanel.Controls.Add(_sessionMuteEnabled);
+            _sessionMuted.Text = "Muted";
+            sessionPanel.Controls.Add(_sessionMuted);
+            editor.Controls.Add(sessionPanel, 1, 9);
+            editor.SetColumnSpan(sessionPanel, 2);
 
             var ruleButtons = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.LeftToRight };
             ruleButtons.Controls.Add(MakeButton("Add", AddRule));
@@ -1392,7 +1548,7 @@ namespace PrimaryAudioSwitcher
             ruleButtons.Controls.Add(MakeButton("Import", ImportRule));
             ruleButtons.Controls.Add(MakeButton("Test", TestRule));
             ruleButtons.Controls.Add(MakeButton("Validate", ValidateRules));
-            editor.Controls.Add(ruleButtons, 1, 9);
+            editor.Controls.Add(ruleButtons, 1, 11);
             editor.SetColumnSpan(ruleButtons, 2);
         }
 
@@ -1402,13 +1558,13 @@ namespace PrimaryAudioSwitcher
             {
                 Dock = DockStyle.Fill,
                 ColumnCount = 3,
-                RowCount = 8,
+                RowCount = 11,
                 Padding = new Padding(10)
             };
             editor.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 120));
             editor.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
             editor.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 150));
-            for (var i = 0; i < 8; i++)
+            for (var i = 0; i < 11; i++)
             {
                 editor.RowStyles.Add(new RowStyle(SizeType.Absolute, 36));
             }
@@ -1465,6 +1621,34 @@ namespace PrimaryAudioSwitcher
             _paused.Dock = DockStyle.Fill;
             editor.Controls.Add(_paused, 1, 6);
             editor.SetColumnSpan(_paused, 2);
+
+            AddLabel(editor, "Profile", 7);
+            _activeProfile.DropDownStyle = ComboBoxStyle.DropDown;
+            _activeProfile.Dock = DockStyle.Fill;
+            editor.Controls.Add(_activeProfile, 1, 7);
+            editor.SetColumnSpan(_activeProfile, 2);
+
+            AddLabel(editor, "Output roles", 8);
+            var rolePanel = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.LeftToRight };
+            _roleConsole.Text = "Console";
+            _roleMultimedia.Text = "Multimedia";
+            _roleCommunications.Text = "Communications";
+            rolePanel.Controls.Add(_roleConsole);
+            rolePanel.Controls.Add(_roleMultimedia);
+            rolePanel.Controls.Add(_roleCommunications);
+            editor.Controls.Add(rolePanel, 1, 8);
+            editor.SetColumnSpan(rolePanel, 2);
+
+            AddLabel(editor, "Failures", 9);
+            _notifyFailures.Text = "Notify switch failures";
+            _notifyFailures.Dock = DockStyle.Fill;
+            editor.Controls.Add(_notifyFailures, 1, 9);
+            editor.SetColumnSpan(_notifyFailures, 2);
+
+            var undoPanel = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.LeftToRight };
+            undoPanel.Controls.Add(MakeButton("Undo changes", UndoChanges));
+            editor.Controls.Add(undoPanel, 1, 10);
+            editor.SetColumnSpan(undoPanel, 2);
         }
 
         private void BuildStatusTab(TabPage tab)
@@ -1534,12 +1718,18 @@ namespace PrimaryAudioSwitcher
 
         private void LoadConfig()
         {
+            RefreshProfileChoices();
             _poll.Value = Math.Max(_poll.Minimum, Math.Min(_poll.Maximum, Config.PollMilliseconds));
             _cooldown.Value = Math.Max(_cooldown.Minimum, Math.Min(_cooldown.Maximum, Config.SwitchCooldownMilliseconds));
             _processStartWatcher.Checked = Config.ProcessStartWatcherEnabled;
             _deviceChangeWatcher.Checked = Config.DeviceChangeWatcherEnabled;
             _paused.Checked = Config.Paused;
             _notifications.Checked = Config.NotificationsEnabled;
+            _notifyFailures.Checked = Config.NotifyFailures;
+            _roleConsole.Checked = Config.RoleConsole;
+            _roleMultimedia.Checked = Config.RoleMultimedia;
+            _roleCommunications.Checked = Config.RoleCommunications;
+            _activeProfile.Text = string.IsNullOrWhiteSpace(Config.ActiveProfile) ? "Default" : Config.ActiveProfile;
             _exitAction.SelectedIndex = Config.ProcessExitAction == ProcessExitAction.PreviousDevice
                 ? 1
                 : Config.ProcessExitAction == ProcessExitAction.None ? 2 : 0;
@@ -1669,12 +1859,13 @@ namespace PrimaryAudioSwitcher
 
             Config.Rules.Add(rule);
             ReloadRuleList();
-            _rules.SelectedIndex = _rules.Items.Count - 1;
+            SelectRuleByConfigIndex(Config.Rules.Count - 1);
         }
 
         private void UpdateRule(object sender, EventArgs args)
         {
-            if (_rules.SelectedIndex < 0)
+            var configIndex = GetSelectedRuleIndex();
+            if (configIndex < 0)
             {
                 return;
             }
@@ -1685,41 +1876,42 @@ namespace PrimaryAudioSwitcher
                 return;
             }
 
-            Config.Rules[_rules.SelectedIndex] = rule;
-            var selected = _rules.SelectedIndex;
+            Config.Rules[configIndex] = rule;
             ReloadRuleList();
-            _rules.SelectedIndex = selected;
+            SelectRuleByConfigIndex(configIndex);
         }
 
         private void DeleteRule(object sender, EventArgs args)
         {
-            if (_rules.SelectedIndex < 0)
+            var configIndex = GetSelectedRuleIndex();
+            if (configIndex < 0)
             {
                 return;
             }
 
-            var selected = _rules.SelectedIndex;
-            Config.Rules.RemoveAt(selected);
+            Config.Rules.RemoveAt(configIndex);
             ReloadRuleList();
             if (_rules.Items.Count > 0)
             {
-                _rules.SelectedIndex = Math.Min(selected, _rules.Items.Count - 1);
+                var nextIndex = _visibleRuleIndexes.FindIndex(index => index >= configIndex);
+                _rules.SelectedIndex = nextIndex >= 0 ? nextIndex : _rules.Items.Count - 1;
             }
         }
 
         private void DuplicateRule(object sender, EventArgs args)
         {
-            if (_rules.SelectedIndex < 0)
+            var configIndex = GetSelectedRuleIndex();
+            if (configIndex < 0)
             {
                 return;
             }
 
-            var copy = Config.Rules[_rules.SelectedIndex].Clone();
+            var copy = Config.Rules[configIndex].Clone();
             copy.Name = (copy.Name ?? "unnamed") + " copy";
-            var target = _rules.SelectedIndex + 1;
+            var target = configIndex + 1;
             Config.Rules.Insert(target, copy);
             ReloadRuleList();
-            _rules.SelectedIndex = target;
+            SelectRuleByConfigIndex(target);
         }
 
         private void UseCurrentForeground(object sender, EventArgs args)
@@ -1779,7 +1971,7 @@ namespace PrimaryAudioSwitcher
                 var rule = AudioRule.FromXml(document.Root, 3, 500);
                 Config.Rules.Add(rule);
                 ReloadRuleList();
-                _rules.SelectedIndex = _rules.Items.Count - 1;
+                SelectRuleByConfigIndex(Config.Rules.Count - 1);
             }
         }
 
@@ -1795,7 +1987,7 @@ namespace PrimaryAudioSwitcher
 
         private void MoveSelectedRule(int direction)
         {
-            var selected = _rules.SelectedIndex;
+            var selected = GetSelectedRuleIndex();
             var target = selected + direction;
             if (selected < 0 || target < 0 || target >= Config.Rules.Count)
             {
@@ -1806,7 +1998,7 @@ namespace PrimaryAudioSwitcher
             Config.Rules.RemoveAt(selected);
             Config.Rules.Insert(target, item);
             ReloadRuleList();
-            _rules.SelectedIndex = target;
+            SelectRuleByConfigIndex(target);
         }
 
         private void TestRule(object sender, EventArgs args)
@@ -1825,7 +2017,14 @@ namespace PrimaryAudioSwitcher
                 return;
             }
 
-            _audio.SetDefaultRenderDevice(device.Id);
+            if (!_roleConsole.Checked && !_roleMultimedia.Checked && !_roleCommunications.Checked)
+            {
+                MessageBox.Show(this, "Enable at least one output role.", "Settings", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+            _audio.SetDefaultRenderDevice(device.Id, _roleConsole.Checked, _roleMultimedia.Checked, _roleCommunications.Checked);
+            _audio.ApplySessionSettings(rule.TargetProcesses, rule.SessionVolumeEnabled, rule.SessionVolumePercent, rule.SessionMuteEnabled, rule.SessionMuted);
             RefreshCurrentDeviceLabel();
             MessageBox.Show(this, "Switched to " + device.Name + ".", "Settings", MessageBoxButtons.OK, MessageBoxIcon.Information);
         }
@@ -1885,9 +2084,14 @@ namespace PrimaryAudioSwitcher
             Config.FallbackDeviceId = fallback.Id;
             Config.LogEnabled = _log.Checked;
             Config.NotificationsEnabled = _notifications.Checked;
+            Config.NotifyFailures = _notifyFailures.Checked;
             Config.Paused = _paused.Checked;
             Config.ProcessStartWatcherEnabled = _processStartWatcher.Checked;
             Config.DeviceChangeWatcherEnabled = _deviceChangeWatcher.Checked;
+            Config.RoleConsole = _roleConsole.Checked;
+            Config.RoleMultimedia = _roleMultimedia.Checked;
+            Config.RoleCommunications = _roleCommunications.Checked;
+            Config.ActiveProfile = string.IsNullOrWhiteSpace(_activeProfile.Text) ? "Default" : _activeProfile.Text.Trim();
             Config.ProcessExitAction = _exitAction.SelectedIndex == 1
                 ? ProcessExitAction.PreviousDevice
                 : _exitAction.SelectedIndex == 2 ? ProcessExitAction.None : ProcessExitAction.FallbackDevice;
@@ -1915,6 +2119,7 @@ namespace PrimaryAudioSwitcher
             return new AudioRule
             {
                 Name = string.IsNullOrWhiteSpace(_name.Text) ? processName : _name.Text.Trim(),
+                Profile = string.IsNullOrWhiteSpace(_profile.Text) ? "Default" : _profile.Text.Trim(),
                 Enabled = _enabled.Checked,
                 ForegroundProcess = _mode.SelectedIndex == 0 ? processName : null,
                 RunningProcess = _mode.SelectedIndex == 1 ? processName : null,
@@ -1925,19 +2130,25 @@ namespace PrimaryAudioSwitcher
                 AlternateDeviceId = alternateDevice.Id,
                 RetryCount = (int)_startRetryCount.Value,
                 RetryDelayMilliseconds = (int)_startRetryDelay.Value,
-                ExitDelayMilliseconds = (int)_exitDelay.Value
+                ExitDelayMilliseconds = (int)_exitDelay.Value,
+                SessionVolumeEnabled = _sessionVolumeEnabled.Checked,
+                SessionVolumePercent = (int)_sessionVolume.Value,
+                SessionMuteEnabled = _sessionMuteEnabled.Checked,
+                SessionMuted = _sessionMuted.Checked
             };
         }
 
         private void LoadSelectedRule()
         {
-            if (_rules.SelectedIndex < 0)
+            var configIndex = GetSelectedRuleIndex();
+            if (configIndex < 0)
             {
                 return;
             }
 
-            var rule = Config.Rules[_rules.SelectedIndex];
+            var rule = Config.Rules[configIndex];
             _name.Text = rule.Name ?? "";
+            _profile.Text = string.IsNullOrWhiteSpace(rule.Profile) ? "Default" : rule.Profile;
             _enabled.Checked = rule.Enabled;
             _windowTitle.Text = rule.WindowTitle ?? "";
             if (!string.IsNullOrWhiteSpace(rule.ForegroundProcess))
@@ -1955,17 +2166,30 @@ namespace PrimaryAudioSwitcher
             _startRetryCount.Value = Math.Max(_startRetryCount.Minimum, Math.Min(_startRetryCount.Maximum, rule.RetryCount));
             _startRetryDelay.Value = Math.Max(_startRetryDelay.Minimum, Math.Min(_startRetryDelay.Maximum, rule.RetryDelayMilliseconds));
             _exitDelay.Value = Math.Max(_exitDelay.Minimum, Math.Min(_exitDelay.Maximum, rule.ExitDelayMilliseconds));
+            _sessionVolumeEnabled.Checked = rule.SessionVolumeEnabled;
+            _sessionVolume.Value = Math.Max(_sessionVolume.Minimum, Math.Min(_sessionVolume.Maximum, rule.SessionVolumePercent));
+            _sessionMuteEnabled.Checked = rule.SessionMuteEnabled;
+            _sessionMuted.Checked = rule.SessionMuted;
         }
 
         private void ReloadRuleList()
         {
             var matching = GetMatchingRuleIndexes();
+            var filter = (_ruleFilter.Text ?? "").Trim();
             _rules.Items.Clear();
+            _visibleRuleIndexes.Clear();
             for (var i = 0; i < Config.Rules.Count; i++)
             {
+                if (!RuleMatchesFilter(Config.Rules[i], filter))
+                {
+                    continue;
+                }
+
+                _visibleRuleIndexes.Add(i);
                 _rules.Items.Add((matching.Contains(i) ? ">> " : "") + Config.Rules[i]);
             }
             RefreshStatusSummaries(matching);
+            RefreshProfileChoices();
         }
 
         private HashSet<int> GetMatchingRuleIndexes()
@@ -1980,7 +2204,7 @@ namespace PrimaryAudioSwitcher
 
             for (var i = 0; i < Config.Rules.Count; i++)
             {
-                if (Config.Rules[i].IsMatch(foreground, running))
+                if (Config.IsRuleInActiveProfile(Config.Rules[i]) && Config.Rules[i].IsMatch(foreground, running))
                 {
                     result.Add(i);
                 }
@@ -2005,6 +2229,68 @@ namespace PrimaryAudioSwitcher
             {
                 _history.Items.Add(item.ToString());
             }
+        }
+
+        private int GetSelectedRuleIndex()
+        {
+            return _rules.SelectedIndex >= 0 && _rules.SelectedIndex < _visibleRuleIndexes.Count
+                ? _visibleRuleIndexes[_rules.SelectedIndex]
+                : -1;
+        }
+
+        private void SelectRuleByConfigIndex(int configIndex)
+        {
+            var visibleIndex = _visibleRuleIndexes.IndexOf(configIndex);
+            if (visibleIndex >= 0)
+            {
+                _rules.SelectedIndex = visibleIndex;
+            }
+        }
+
+        private static bool RuleMatchesFilter(AudioRule rule, string filter)
+        {
+            if (string.IsNullOrWhiteSpace(filter))
+            {
+                return true;
+            }
+
+            return ContainsIgnoreCase(rule.Name, filter) ||
+                   ContainsIgnoreCase(rule.Profile, filter) ||
+                   ContainsIgnoreCase(rule.ForegroundProcess, filter) ||
+                   ContainsIgnoreCase(rule.RunningProcess, filter) ||
+                   ContainsIgnoreCase(rule.WindowTitle, filter) ||
+                   ContainsIgnoreCase(rule.Device, filter) ||
+                   ContainsIgnoreCase(rule.AlternateDevice, filter);
+        }
+
+        private static bool ContainsIgnoreCase(string value, string filter)
+        {
+            return !string.IsNullOrWhiteSpace(value) &&
+                   value.IndexOf(filter, StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+
+        private void RefreshProfileChoices()
+        {
+            var current = string.IsNullOrWhiteSpace(_activeProfile.Text) ? Config.ActiveProfile : _activeProfile.Text;
+            var profiles = Config.Rules
+                .Select(rule => string.IsNullOrWhiteSpace(rule.Profile) ? "Default" : rule.Profile)
+                .Concat(new[] { "Default", "All" })
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .OrderBy(profile => profile.Equals("All", StringComparison.OrdinalIgnoreCase) ? "" : profile, StringComparer.OrdinalIgnoreCase)
+                .ToList();
+
+            _activeProfile.Items.Clear();
+            foreach (var profile in profiles)
+            {
+                _activeProfile.Items.Add(profile);
+            }
+            _activeProfile.Text = string.IsNullOrWhiteSpace(current) ? "Default" : current;
+        }
+
+        private void UndoChanges(object sender, EventArgs args)
+        {
+            Config = _originalConfig.Clone();
+            LoadConfig();
         }
 
         private static string SafeProcessName(Process process)
@@ -2275,7 +2561,7 @@ namespace PrimaryAudioSwitcher
             builder.AppendLine("Matching rules:");
             foreach (var rule in config.Rules)
             {
-                if (rule.IsMatch(foreground, running))
+                if (config.IsRuleInActiveProfile(rule) && rule.IsMatch(foreground, running))
                 {
                     builder.AppendLine("  " + rule);
                 }
@@ -2544,16 +2830,133 @@ namespace PrimaryAudioSwitcher
 
         public void SetDefaultRenderDevice(string deviceId)
         {
+            SetDefaultRenderDevice(deviceId, true, true, true);
+        }
+
+        public void SetDefaultRenderDevice(string deviceId, bool console, bool multimedia, bool communications)
+        {
             var policy = (IPolicyConfig)Activator.CreateInstance(Type.GetTypeFromCLSID(ComIds.PolicyConfigClient));
             try
             {
-                Marshal.ThrowExceptionForHR(policy.SetDefaultEndpoint(deviceId, ERole.eConsole));
-                Marshal.ThrowExceptionForHR(policy.SetDefaultEndpoint(deviceId, ERole.eMultimedia));
-                Marshal.ThrowExceptionForHR(policy.SetDefaultEndpoint(deviceId, ERole.eCommunications));
+                if (console)
+                {
+                    Marshal.ThrowExceptionForHR(policy.SetDefaultEndpoint(deviceId, ERole.eConsole));
+                }
+                if (multimedia)
+                {
+                    Marshal.ThrowExceptionForHR(policy.SetDefaultEndpoint(deviceId, ERole.eMultimedia));
+                }
+                if (communications)
+                {
+                    Marshal.ThrowExceptionForHR(policy.SetDefaultEndpoint(deviceId, ERole.eCommunications));
+                }
             }
             finally
             {
                 Marshal.ReleaseComObject(policy);
+            }
+        }
+
+        public void ApplySessionSettings(IReadOnlyList<string> processNames, bool setVolume, int volumePercent, bool setMute, bool muted)
+        {
+            if ((processNames == null || processNames.Count == 0) || (!setVolume && !setMute))
+            {
+                return;
+            }
+
+            var targets = new HashSet<string>(processNames, StringComparer.OrdinalIgnoreCase);
+            var volume = Math.Max(0, Math.Min(100, volumePercent)) / 100f;
+            var enumerator = (IMMDeviceEnumerator)Activator.CreateInstance(Type.GetTypeFromCLSID(ComIds.MMDeviceEnumerator));
+            IMMDeviceCollection collection = null;
+
+            try
+            {
+                Marshal.ThrowExceptionForHR(enumerator.EnumAudioEndpoints(EDataFlow.eRender, DeviceState.Active, out collection));
+                uint deviceCount;
+                Marshal.ThrowExceptionForHR(collection.GetCount(out deviceCount));
+                for (uint deviceIndex = 0; deviceIndex < deviceCount; deviceIndex++)
+                {
+                    IMMDevice device = null;
+                    IAudioSessionManager2 manager = null;
+                    IAudioSessionEnumerator sessions = null;
+                    try
+                    {
+                        Marshal.ThrowExceptionForHR(collection.Item(deviceIndex, out device));
+                        var managerIid = typeof(IAudioSessionManager2).GUID;
+                        object managerObject;
+                        Marshal.ThrowExceptionForHR(device.Activate(ref managerIid, ClsCtx.All, IntPtr.Zero, out managerObject));
+                        manager = (IAudioSessionManager2)managerObject;
+                        Marshal.ThrowExceptionForHR(manager.GetSessionEnumerator(out sessions));
+                        int sessionCount;
+                        Marshal.ThrowExceptionForHR(sessions.GetCount(out sessionCount));
+                        for (var sessionIndex = 0; sessionIndex < sessionCount; sessionIndex++)
+                        {
+                            IAudioSessionControl2 control = null;
+                            try
+                            {
+                                Marshal.ThrowExceptionForHR(sessions.GetSession(sessionIndex, out control));
+                                uint processId;
+                                Marshal.ThrowExceptionForHR(control.GetProcessId(out processId));
+                                if (processId == 0)
+                                {
+                                    continue;
+                                }
+
+                                using (var process = Process.GetProcessById((int)processId))
+                                {
+                                    if (!targets.Contains(process.ProcessName))
+                                    {
+                                        continue;
+                                    }
+                                }
+
+                                var simpleVolume = (ISimpleAudioVolume)control;
+                                var eventContext = Guid.Empty;
+                                if (setVolume)
+                                {
+                                    Marshal.ThrowExceptionForHR(simpleVolume.SetMasterVolume(volume, ref eventContext));
+                                }
+                                if (setMute)
+                                {
+                                    Marshal.ThrowExceptionForHR(simpleVolume.SetMute(muted, ref eventContext));
+                                }
+                            }
+                            catch
+                            {
+                            }
+                            finally
+                            {
+                                if (control != null)
+                                {
+                                    Marshal.ReleaseComObject(control);
+                                }
+                            }
+                        }
+                    }
+                    finally
+                    {
+                        if (sessions != null)
+                        {
+                            Marshal.ReleaseComObject(sessions);
+                        }
+                        if (manager != null)
+                        {
+                            Marshal.ReleaseComObject(manager);
+                        }
+                        if (device != null)
+                        {
+                            Marshal.ReleaseComObject(device);
+                        }
+                    }
+                }
+            }
+            finally
+            {
+                if (collection != null)
+                {
+                    Marshal.ReleaseComObject(collection);
+                }
+                Marshal.ReleaseComObject(enumerator);
             }
         }
 
@@ -2656,6 +3059,61 @@ namespace PrimaryAudioSwitcher
         int GetCount(out uint propertyCount);
         int GetAt(uint propertyIndex, out PropertyKey key);
         int GetValue(ref PropertyKey key, out PropVariant value);
+    }
+
+    [ComImport]
+    [Guid("77AA99A0-1BD6-484F-8BC7-2C654C9A9B6F")]
+    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    internal interface IAudioSessionManager2
+    {
+        int GetAudioSessionControl(IntPtr audioSessionGuid, uint streamFlags, out IAudioSessionControl2 sessionControl);
+        int GetSimpleAudioVolume(IntPtr audioSessionGuid, uint streamFlags, out ISimpleAudioVolume audioVolume);
+        int GetSessionEnumerator(out IAudioSessionEnumerator sessionEnumerator);
+        int RegisterSessionNotification(IntPtr sessionNotification);
+        int UnregisterSessionNotification(IntPtr sessionNotification);
+        int RegisterDuckNotification(string sessionId, IntPtr duckNotification);
+        int UnregisterDuckNotification(IntPtr duckNotification);
+    }
+
+    [ComImport]
+    [Guid("E2F5BB11-0570-40CA-ACDD-3AA01277DEE8")]
+    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    internal interface IAudioSessionEnumerator
+    {
+        int GetCount(out int sessionCount);
+        int GetSession(int sessionIndex, out IAudioSessionControl2 session);
+    }
+
+    [ComImport]
+    [Guid("BFB7FF88-7239-4FC9-8FA2-07C950BE9C6D")]
+    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    internal interface IAudioSessionControl2
+    {
+        int GetState(out int state);
+        int GetDisplayName(out IntPtr displayName);
+        int SetDisplayName(string displayName, Guid eventContext);
+        int GetIconPath(out IntPtr iconPath);
+        int SetIconPath(string iconPath, Guid eventContext);
+        int GetGroupingParam(out Guid groupingParam);
+        int SetGroupingParam(Guid groupingParam, Guid eventContext);
+        int RegisterAudioSessionNotification(IntPtr notifications);
+        int UnregisterAudioSessionNotification(IntPtr notifications);
+        int GetSessionIdentifier(out IntPtr sessionIdentifier);
+        int GetSessionInstanceIdentifier(out IntPtr sessionInstanceIdentifier);
+        int GetProcessId(out uint processId);
+        int IsSystemSoundsSession();
+        int SetDuckingPreference(bool optOut);
+    }
+
+    [ComImport]
+    [Guid("87CE5498-68D6-44E5-9215-6DA47EF883D8")]
+    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    internal interface ISimpleAudioVolume
+    {
+        int SetMasterVolume(float level, ref Guid eventContext);
+        int GetMasterVolume(out float level);
+        int SetMute(bool isMuted, ref Guid eventContext);
+        int GetMute(out bool isMuted);
     }
 
     [ComImport]

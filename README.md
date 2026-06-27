@@ -50,14 +50,20 @@ Use `Settings` from the tray menu to edit rules. For each rule you can:
 
 Settings are split into tabs:
 
-- `Rules`: rule list and per-rule matching/device behavior.
-- `Global`: fallback, exit behavior, polling, watchers, startup, pause, and notifications.
+- `Rules`: rule list, search/filter, profile, per-rule matching, device behavior, and app session volume/mute.
+- `Global`: fallback, exit behavior, polling, watchers, startup, pause, profiles, output roles, failure notifications, and undo.
 - `Status`: current default render device and log access.
 
 - Select `Foreground app` or `Running process`.
+- Assign rules to a profile and choose the active profile from `Global`; `All` evaluates every profile.
 - Pick a process from the currently running process list.
 - Use `Browse exe` to select a local executable file.
 - Pick an active render audio device from the device list, or type a device-name substring.
+- Choose which Windows default endpoint roles are changed: Console, Multimedia, and/or Communications.
+- Enable switch-failure notifications separately from normal change notifications.
+- Filter rules by name, profile, process, title, or device.
+- Undo settings-window changes back to the values loaded when the dialog opened.
+- Set per-app audio session volume and mute state when a rule applies.
 - Enable `Use WMI start event` to switch immediately when a configured running-process rule starts.
 - Set retry count and retry delay per rule so the selected default device is re-applied shortly after launch.
 - Use `Test` to immediately switch to the selected rule's device.
@@ -95,13 +101,13 @@ Example:
 
 ```xml
 <?xml version="1.0" encoding="utf-8"?>
-<PrimaryAudioSwitcher pollMilliseconds="1000" fallbackDevice="" fallbackDeviceId="" log="true" notifications="false" paused="false" processStartWatcher="true" deviceChangeWatcher="true" switchCooldownMilliseconds="0" processExitAction="fallback">
-  <Rule name="Game foreground" enabled="true" foregroundProcess="Game.exe" windowTitle="" device="Speakers" deviceId="" alternateDevice="" alternateDeviceId="" retryCount="3" retryDelayMilliseconds="500" exitDelayMilliseconds="0" />
-  <Rule name="Discord running" enabled="true" runningProcess="Discord.exe" windowTitle="" device="Headset" deviceId="" alternateDevice="" alternateDeviceId="" retryCount="3" retryDelayMilliseconds="500" exitDelayMilliseconds="0" />
+<PrimaryAudioSwitcher pollMilliseconds="1000" fallbackDevice="" fallbackDeviceId="" log="true" notifications="false" notifyFailures="true" paused="false" processStartWatcher="true" deviceChangeWatcher="true" roleConsole="true" roleMultimedia="true" roleCommunications="true" activeProfile="Default" switchCooldownMilliseconds="0" processExitAction="fallback">
+  <Rule name="Game foreground" profile="Default" enabled="true" foregroundProcess="Game.exe" windowTitle="" device="Speakers" deviceId="" alternateDevice="" alternateDeviceId="" retryCount="3" retryDelayMilliseconds="500" exitDelayMilliseconds="0" sessionVolumeEnabled="false" sessionVolumePercent="100" sessionMuteEnabled="false" sessionMuted="false" />
+  <Rule name="Discord running" profile="Default" enabled="true" runningProcess="Discord.exe" windowTitle="" device="Headset" deviceId="" alternateDevice="" alternateDeviceId="" retryCount="3" retryDelayMilliseconds="500" exitDelayMilliseconds="0" sessionVolumeEnabled="false" sessionVolumePercent="100" sessionMuteEnabled="false" sessionMuted="false" />
 </PrimaryAudioSwitcher>
 ```
 
-Rules are evaluated top to bottom. `foregroundProcess` has priority over `runningProcess` inside a rule. Process names may include or omit `.exe`.
+Rules in the active profile are evaluated top to bottom. `activeProfile="All"` evaluates every rule. `foregroundProcess` has priority over `runningProcess` inside a rule. Process names may include or omit `.exe`.
 
 The settings window saves process names without `.exe`, which matches how Windows reports `Process.ProcessName`.
 
@@ -128,6 +134,10 @@ When `deviceChangeWatcher` is enabled, the app subscribes to `Win32_DeviceChange
 - `none`: do nothing.
 
 `switchCooldownMilliseconds` applies to normal polling/foreground switches. WMI process-start switches and retries bypass it so launch-time audio binding is not delayed.
+
+`roleConsole`, `roleMultimedia`, and `roleCommunications` control which Windows default render roles are updated. At least one role must be enabled for switching to occur.
+
+Per-rule `sessionVolumeEnabled` / `sessionVolumePercent` and `sessionMuteEnabled` / `sessionMuted` are applied to matching process audio sessions after a successful device switch. Windows only exposes sessions that already exist, so apps may need to be producing audio before session volume or mute can be changed.
 
 ## Notes
 
