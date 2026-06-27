@@ -56,14 +56,19 @@ Settings are split into tabs:
 
 - Select `Foreground app` or `Running process`.
 - Assign rules to a profile and choose the active profile from `Global`; `All` evaluates every profile.
+- Temporarily disable a rule for 30 minutes or until the app exits.
 - Pick a process from the currently running process list.
 - Use `Browse exe` to select a local executable file.
 - Pick an active render audio device from the device list, or type a device-name substring.
+- Define device aliases in `Global` with `Alias=Device substring` lines, then use the alias as a rule device.
 - Choose which Windows default endpoint roles are changed: Console, Multimedia, and/or Communications.
 - Enable switch-failure notifications separately from normal change notifications.
 - Filter rules by name, profile, process, title, or device.
 - Undo settings-window changes back to the values loaded when the dialog opened.
 - Set per-app audio session volume and mute state when a rule applies.
+- Use `Dry run` or tray `Preview rule match` to see which rule would apply without switching.
+- Validate rules to detect duplicate match conditions and lower-priority rules hidden by earlier rules.
+- Override exit restore behavior per rule: global setting, fallback, previous device, or no action.
 - Enable `Use WMI start event` to switch immediately when a configured running-process rule starts.
 - Set retry count and retry delay per rule so the selected default device is re-applied shortly after launch.
 - Use `Test` to immediately switch to the selected rule's device.
@@ -82,8 +87,11 @@ Settings are split into tabs:
 - Match foreground rules by optional window title substring.
 - Enter multiple process names in one rule with `;`, for example `launcher;game`.
 - Open `Diagnostics` from the tray menu to inspect foreground process/title, active devices, running processes, and matching rules.
-- Restore the previous `config.xml.bak` from the tray menu.
+- Restore the newest timestamped config backup from the tray menu. The app keeps the latest five `config.*.bak.xml` files.
 - Re-evaluate rules automatically when Windows reports device connection changes.
+- Re-evaluate rules manually from the tray menu.
+- Cycle the current output device or active profile from the tray menu.
+- Use global hotkeys: `Ctrl+Alt+P` pause/resume, `Ctrl+Alt+R` re-evaluate, `Ctrl+Alt+D` cycle device, `Ctrl+Alt+O` cycle profile.
 - Duplicate rules from the `Rules` tab.
 - Fill a rule from the current foreground app with `Use current`.
 - Export or import a single rule as XML.
@@ -102,7 +110,8 @@ Example:
 ```xml
 <?xml version="1.0" encoding="utf-8"?>
 <PrimaryAudioSwitcher pollMilliseconds="1000" fallbackDevice="" fallbackDeviceId="" log="true" notifications="false" notifyFailures="true" paused="false" processStartWatcher="true" deviceChangeWatcher="true" roleConsole="true" roleMultimedia="true" roleCommunications="true" activeProfile="Default" switchCooldownMilliseconds="0" processExitAction="fallback">
-  <Rule name="Game foreground" profile="Default" enabled="true" foregroundProcess="Game.exe" windowTitle="" device="Speakers" deviceId="" alternateDevice="" alternateDeviceId="" retryCount="3" retryDelayMilliseconds="500" exitDelayMilliseconds="0" sessionVolumeEnabled="false" sessionVolumePercent="100" sessionMuteEnabled="false" sessionMuted="false" />
+  <DeviceAlias alias="Headset" device="Headset" deviceId="" />
+  <Rule name="Game foreground" profile="Default" enabled="true" foregroundProcess="Game.exe" windowTitle="" device="Speakers" deviceId="" alternateDevice="" alternateDeviceId="" retryCount="3" retryDelayMilliseconds="500" exitDelayMilliseconds="0" exitAction="global" disabledUntilUtc="" sessionVolumeEnabled="false" sessionVolumePercent="100" sessionMuteEnabled="false" sessionMuted="false" />
   <Rule name="Discord running" profile="Default" enabled="true" runningProcess="Discord.exe" windowTitle="" device="Headset" deviceId="" alternateDevice="" alternateDeviceId="" retryCount="3" retryDelayMilliseconds="500" exitDelayMilliseconds="0" sessionVolumeEnabled="false" sessionVolumePercent="100" sessionMuteEnabled="false" sessionMuted="false" />
 </PrimaryAudioSwitcher>
 ```
@@ -138,6 +147,10 @@ When `deviceChangeWatcher` is enabled, the app subscribes to `Win32_DeviceChange
 `roleConsole`, `roleMultimedia`, and `roleCommunications` control which Windows default render roles are updated. At least one role must be enabled for switching to occur.
 
 Per-rule `sessionVolumeEnabled` / `sessionVolumePercent` and `sessionMuteEnabled` / `sessionMuted` are applied to matching process audio sessions after a successful device switch. Windows only exposes sessions that already exist, so apps may need to be producing audio before session volume or mute can be changed.
+
+`DeviceAlias` maps a stable alias to a device substring or endpoint ID. Rules can use the alias in `device` or `alternateDevice`, which helps when Windows device names change.
+
+Per-rule `exitAction` accepts `global`, `fallback`, `previous`, or `none`. `disabledUntilUtc` can temporarily suppress a rule until a UTC timestamp; the Settings window also supports a restart-only temporary disable that is not written to XML.
 
 ## Notes
 

@@ -82,6 +82,7 @@ namespace PrimaryAudioSwitcher
             _timer.Tick += (sender, eventArgs) => EvaluateRules();
             _timer.Start();
             _paused = _config.Paused;
+            HotKeyManager.Register(_uiThread, TogglePause, ManualEvaluate, CycleOutputDevice, CycleActiveProfile);
             StartWatchers();
             EvaluateRules();
         }
@@ -93,6 +94,10 @@ namespace PrimaryAudioSwitcher
             menu.Items.Add(status);
             menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add("Pause automation", null, (sender, args) => TogglePause()).Name = "pause";
+            menu.Items.Add("Re-evaluate now", null, (sender, args) => ManualEvaluate());
+            menu.Items.Add("Preview rule match", null, (sender, args) => PreviewRuleMatch());
+            menu.Items.Add("Cycle active profile", null, (sender, args) => CycleActiveProfile());
+            menu.Items.Add("Cycle output device", null, (sender, args) => CycleOutputDevice());
             menu.Items.Add("Settings", null, (sender, args) => OpenSettings());
             menu.Items.Add("Reload config", null, (sender, args) => ReloadConfig());
             menu.Items.Add("Open config", null, (sender, args) => Process.Start("notepad.exe", _configPath));
@@ -130,6 +135,11 @@ namespace PrimaryAudioSwitcher
                 foreach (var rule in _config.Rules)
                 {
                     if (!_config.IsRuleInActiveProfile(rule))
+                    {
+                        continue;
+                    }
+
+                    if (rule.IsTemporarilyDisabled)
                     {
                         continue;
                     }
@@ -186,12 +196,12 @@ namespace PrimaryAudioSwitcher
 
         private bool ApplyDevice(string deviceId, string deviceMatch, string alternateDeviceId, string alternateDeviceMatch, string ruleName, string foreground, bool force)
         {
-            var device = _audio.FindRenderDevice(deviceId, deviceMatch);
+            var device = _audio.FindRenderDevice(deviceId, deviceMatch, _config.DeviceAliases);
             if (device == null)
             {
                 if (!string.IsNullOrWhiteSpace(alternateDeviceId) || !string.IsNullOrWhiteSpace(alternateDeviceMatch))
                 {
-                    device = _audio.FindRenderDevice(alternateDeviceId, alternateDeviceMatch);
+                    device = _audio.FindRenderDevice(alternateDeviceId, alternateDeviceMatch, _config.DeviceAliases);
                     if (device != null)
                     {
                         Log("Using alternate device for rule '" + ruleName + "': " + device.Name);
@@ -232,7 +242,7 @@ namespace PrimaryAudioSwitcher
                 _lastSwitchAt = DateTimeOffset.Now;
                 AddSwitchHistory(ruleName, device.Name, foreground, force);
                 SetStatus("Rule: " + ruleName + " -> " + device.Name);
-                ShowNotification("Audio device changed", device.Name + " (" + ruleName + ")");
+                ShowNotification("Audio device changed", "Rule: " + ruleName + Environment.NewLine + "Device: " + device.Name + Environment.NewLine + "Trigger: " + (foreground ?? "unknown"));
                 Log("Applied rule='" + ruleName + "' foreground='" + (foreground ?? "unknown") + "' device='" + device.Name + "'" + (force ? " force=true" : ""));
                 return true;
             }
@@ -408,6 +418,11 @@ namespace PrimaryAudioSwitcher
                     continue;
                 }
 
+                if (rule.IsTemporarilyDisabled)
+                {
+                    continue;
+                }
+
                 if (!rule.MatchesRunningProcess(normalized))
                 {
                     continue;
@@ -428,15 +443,21 @@ namespace PrimaryAudioSwitcher
             }
 
             var normalized = NormalizeProcess(processName);
-            if (string.IsNullOrWhiteSpace(normalized) || _config.ProcessExitAction == ProcessExitAction.None)
+            if (string.IsNullOrWhiteSpace(normalized))
             {
                 return;
             }
 
             var matchingRules = _config.Rules
-                .Where(rule => _config.IsRuleInActiveProfile(rule) && rule.MatchesRunningProcess(normalized))
+                .Where(rule => _config.IsRuleInActiveProfile(rule) && !rule.IsTemporarilyDisabled && rule.MatchesRunningProcess(normalized))
                 .ToList();
             if (matchingRules.Count == 0)
+            {
+                return;
+            }
+
+            var exitAction = ResolveExitAction(matchingRules);
+            if (exitAction == ProcessExitAction.None)
             {
                 return;
             }
@@ -451,14 +472,14 @@ namespace PrimaryAudioSwitcher
             var delay = matchingRules.Max(rule => Math.Max(0, rule.ExitDelayMilliseconds));
             if (delay > 0)
             {
-                ScheduleProcessExitRestore(normalized, delay);
+                ScheduleProcessExitRestore(normalized, delay, exitAction);
                 return;
             }
 
-            RestoreAfterProcessStop(normalized);
+            RestoreAfterProcessStop(normalized, exitAction);
         }
 
-        private void ScheduleProcessExitRestore(string processName, int delayMilliseconds)
+        private void ScheduleProcessExitRestore(string processName, int delayMilliseconds, ProcessExitAction exitAction)
         {
             var restoreTimer = new System.Windows.Forms.Timer { Interval = delayMilliseconds };
             restoreTimer.Tick += delegate
@@ -467,22 +488,22 @@ namespace PrimaryAudioSwitcher
                 restoreTimer.Dispose();
                 if (!IsProcessRunning(processName))
                 {
-                    RestoreAfterProcessStop(processName);
+                    RestoreAfterProcessStop(processName, exitAction);
                 }
             };
             restoreTimer.Start();
         }
 
-        private void RestoreAfterProcessStop(string normalized)
+        private void RestoreAfterProcessStop(string normalized, ProcessExitAction exitAction)
         {
             string previousDeviceId;
             AudioRule previousRule = null;
             previousDeviceId = null;
-            if (_config.ProcessExitAction == ProcessExitAction.PreviousDevice)
+            if (exitAction == ProcessExitAction.PreviousDevice)
             {
                 foreach (var rule in _config.Rules)
                 {
-                    if (rule.MatchesRunningProcess(normalized) &&
+                    if (!rule.IsTemporarilyDisabled && rule.MatchesRunningProcess(normalized) &&
                         _previousDeviceByRule.TryGetValue(rule.Name ?? "", out previousDeviceId))
                     {
                         previousRule = rule;
@@ -497,10 +518,23 @@ namespace PrimaryAudioSwitcher
                 return;
             }
 
-            if (_config.ProcessExitAction == ProcessExitAction.FallbackDevice && _config.HasFallbackDevice)
+            if (exitAction == ProcessExitAction.FallbackDevice && _config.HasFallbackDevice)
             {
                 ApplyDevice(_config.FallbackDeviceId, _config.FallbackDevice, "restore fallback after " + normalized, normalized, true);
             }
+        }
+
+        private ProcessExitAction ResolveExitAction(IReadOnlyList<AudioRule> matchingRules)
+        {
+            foreach (var rule in matchingRules)
+            {
+                if (rule.ExitActionOverride.HasValue)
+                {
+                    return rule.ExitActionOverride.Value;
+                }
+            }
+
+            return _config.ProcessExitAction;
         }
 
         private bool IsSwitchCooldownActive()
@@ -528,6 +562,54 @@ namespace PrimaryAudioSwitcher
                     }
                 };
                 retryTimer.Start();
+            }
+        }
+
+        private void ManualEvaluate()
+        {
+            _lastAppliedDeviceId = null;
+            EvaluateRules();
+        }
+
+        private void PreviewRuleMatch()
+        {
+            MessageBox.Show(RulePreview.Build(_config, _audio), "Primary Audio Switcher Preview", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }
+
+        private void CycleActiveProfile()
+        {
+            var profiles = _config.ProfileNames.ToList();
+            if (profiles.Count == 0)
+            {
+                return;
+            }
+
+            var current = profiles.FindIndex(profile => profile.Equals(_config.ActiveProfile ?? "Default", StringComparison.OrdinalIgnoreCase));
+            _config.ActiveProfile = profiles[(current + 1 + profiles.Count) % profiles.Count];
+            _config.Save(_configPath);
+            SetStatus("Profile: " + _config.ActiveProfile);
+            EvaluateRules();
+        }
+
+        private void CycleOutputDevice()
+        {
+            try
+            {
+                var devices = _audio.ListRenderDevices();
+                if (devices.Count == 0)
+                {
+                    return;
+                }
+
+                var current = _audio.GetDefaultRenderDevice();
+                var currentIndex = current == null ? -1 : devices.FindIndex(device => device.Id.Equals(current.Id, StringComparison.OrdinalIgnoreCase));
+                var next = devices[(currentIndex + 1 + devices.Count) % devices.Count];
+                ApplyDevice(next.Id, next.Name, "manual cycle", "tray", true);
+            }
+            catch (Exception ex)
+            {
+                Log("Manual device cycle failed: " + ex);
+                ShowFailureNotification("Audio device cycle failed", ex.Message);
             }
         }
 
@@ -672,7 +754,7 @@ namespace PrimaryAudioSwitcher
 
         private void RestoreConfigBackup()
         {
-            var backupPath = _configPath + ".bak";
+            var backupPath = ConfigBackups.LatestBackupPath(_configPath);
             if (!File.Exists(backupPath))
             {
                 MessageBox.Show("Backup config was not found.", "Primary Audio Switcher", MessageBoxButtons.OK, MessageBoxIcon.Information);
@@ -783,6 +865,7 @@ namespace PrimaryAudioSwitcher
 
         protected override void ExitThreadCore()
         {
+            HotKeyManager.Unregister(_uiThread);
             StopProcessStartWatcher();
             StopWatcher(ref _deviceChangeWatcher, DeviceChangeWatcherOnEventArrived);
             _timer.Stop();
@@ -864,6 +947,7 @@ namespace PrimaryAudioSwitcher
         public string ActiveProfile { get; set; }
         public int SwitchCooldownMilliseconds { get; set; }
         public ProcessExitAction ProcessExitAction { get; set; }
+        public List<DeviceAlias> DeviceAliases { get; set; }
         public List<AudioRule> Rules { get; set; }
 
         public bool HasFallbackDevice
@@ -882,6 +966,18 @@ namespace PrimaryAudioSwitcher
             var profile = string.IsNullOrWhiteSpace(rule.Profile) ? "Default" : rule.Profile;
             return active.Equals("All", StringComparison.OrdinalIgnoreCase) ||
                    profile.Equals(active, StringComparison.OrdinalIgnoreCase);
+        }
+
+        public IEnumerable<string> ProfileNames
+        {
+            get
+            {
+                return Rules
+                    .Select(rule => string.IsNullOrWhiteSpace(rule.Profile) ? "Default" : rule.Profile)
+                    .Concat(new[] { "Default", "All" })
+                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                    .OrderBy(profile => profile.Equals("All", StringComparison.OrdinalIgnoreCase) ? "" : profile, StringComparer.OrdinalIgnoreCase);
+            }
         }
 
         public static AppConfig Load(string path)
@@ -910,6 +1006,7 @@ namespace PrimaryAudioSwitcher
                 ActiveProfile = (string)root.Attribute("activeProfile") ?? "Default",
                 SwitchCooldownMilliseconds = (int?)root.Attribute("switchCooldownMilliseconds") ?? 0,
                 ProcessExitAction = ProcessExitActions.Parse((string)root.Attribute("processExitAction")),
+                DeviceAliases = root.Elements("DeviceAlias").Select(DeviceAlias.FromXml).ToList(),
                 Rules = root.Elements("Rule")
                     .Select(rule => AudioRule.FromXml(
                         rule,
@@ -938,6 +1035,11 @@ namespace PrimaryAudioSwitcher
                 new XAttribute("switchCooldownMilliseconds", SwitchCooldownMilliseconds),
                 new XAttribute("processExitAction", ProcessExitActions.ToConfigValue(ProcessExitAction)));
 
+            foreach (var alias in DeviceAliases ?? new List<DeviceAlias>())
+            {
+                root.Add(alias.ToXml());
+            }
+
             foreach (var rule in Rules)
             {
                 var element = new XElement("Rule",
@@ -952,6 +1054,8 @@ namespace PrimaryAudioSwitcher
                     new XAttribute("retryCount", rule.RetryCount),
                     new XAttribute("retryDelayMilliseconds", rule.RetryDelayMilliseconds),
                     new XAttribute("exitDelayMilliseconds", rule.ExitDelayMilliseconds),
+                    new XAttribute("exitAction", ProcessExitActions.ToConfigValue(rule.ExitActionOverride)),
+                    new XAttribute("disabledUntilUtc", rule.DisabledUntilUtc.HasValue ? rule.DisabledUntilUtc.Value.UtcDateTime.ToString("O") : ""),
                     new XAttribute("sessionVolumeEnabled", rule.SessionVolumeEnabled ? "true" : "false"),
                     new XAttribute("sessionVolumePercent", rule.SessionVolumePercent),
                     new XAttribute("sessionMuteEnabled", rule.SessionMuteEnabled ? "true" : "false"),
@@ -973,6 +1077,7 @@ namespace PrimaryAudioSwitcher
             if (File.Exists(path))
             {
                 File.Copy(path, path + ".bak", true);
+                ConfigBackups.CreateTimestampedBackup(path, 5);
             }
             new XDocument(new XDeclaration("1.0", "utf-8", "yes"), root).Save(path);
         }
@@ -996,6 +1101,7 @@ namespace PrimaryAudioSwitcher
                 ActiveProfile = ActiveProfile,
                 SwitchCooldownMilliseconds = SwitchCooldownMilliseconds,
                 ProcessExitAction = ProcessExitAction,
+                DeviceAliases = (DeviceAliases ?? new List<DeviceAlias>()).Select(alias => alias.Clone()).ToList(),
                 Rules = Rules.Select(r => r.Clone()).ToList()
             };
         }
@@ -1003,6 +1109,7 @@ namespace PrimaryAudioSwitcher
         public static readonly string DefaultXml =
 @"<?xml version=""1.0"" encoding=""utf-8""?>
 <PrimaryAudioSwitcher pollMilliseconds=""1000"" fallbackDevice="""" fallbackDeviceId="""" log=""true"" notifications=""false"" notifyFailures=""true"" paused=""false"" processStartWatcher=""true"" deviceChangeWatcher=""true"" roleConsole=""true"" roleMultimedia=""true"" roleCommunications=""true"" activeProfile=""Default"" switchCooldownMilliseconds=""0"" processExitAction=""fallback"">
+  <DeviceAlias alias=""Headset"" device=""Headset"" deviceId="""" />
   <!-- device is matched by substring against active Windows render device friendly names. -->
   <Rule name=""Game foreground"" profile=""Default"" enabled=""true"" foregroundProcess=""Game"" windowTitle="""" device=""Speakers"" deviceId="""" alternateDevice="""" alternateDeviceId="""" retryCount=""3"" retryDelayMilliseconds=""500"" exitDelayMilliseconds=""0"" sessionVolumeEnabled=""false"" sessionVolumePercent=""100"" sessionMuteEnabled=""false"" sessionMuted=""false"" />
   <Rule name=""Discord running"" profile=""Default"" enabled=""true"" runningProcess=""Discord"" windowTitle="""" device=""Headset"" deviceId="""" alternateDevice="""" alternateDeviceId="""" retryCount=""3"" retryDelayMilliseconds=""500"" exitDelayMilliseconds=""0"" sessionVolumeEnabled=""false"" sessionVolumePercent=""100"" sessionMuteEnabled=""false"" sessionMuted=""false"" />
@@ -1056,6 +1163,16 @@ namespace PrimaryAudioSwitcher
             return ProcessExitAction.FallbackDevice;
         }
 
+        public static ProcessExitAction? ParseNullable(string value)
+        {
+            if (string.IsNullOrWhiteSpace(value) || value.Equals("global", StringComparison.OrdinalIgnoreCase))
+            {
+                return null;
+            }
+
+            return Parse(value);
+        }
+
         public static string ToConfigValue(ProcessExitAction action)
         {
             if (action == ProcessExitAction.PreviousDevice)
@@ -1069,6 +1186,41 @@ namespace PrimaryAudioSwitcher
             }
 
             return "fallback";
+        }
+
+        public static string ToConfigValue(ProcessExitAction? action)
+        {
+            return action.HasValue ? ToConfigValue(action.Value) : "global";
+        }
+    }
+
+    internal sealed class DeviceAlias
+    {
+        public string Alias { get; set; }
+        public string Device { get; set; }
+        public string DeviceId { get; set; }
+
+        public static DeviceAlias FromXml(XElement element)
+        {
+            return new DeviceAlias
+            {
+                Alias = (string)element.Attribute("alias") ?? "",
+                Device = (string)element.Attribute("device") ?? "",
+                DeviceId = (string)element.Attribute("deviceId") ?? ""
+            };
+        }
+
+        public XElement ToXml()
+        {
+            return new XElement("DeviceAlias",
+                new XAttribute("alias", Alias ?? ""),
+                new XAttribute("device", Device ?? ""),
+                new XAttribute("deviceId", DeviceId ?? ""));
+        }
+
+        public DeviceAlias Clone()
+        {
+            return new DeviceAlias { Alias = Alias, Device = Device, DeviceId = DeviceId };
         }
     }
 
@@ -1087,6 +1239,9 @@ namespace PrimaryAudioSwitcher
         public int RetryCount { get; set; }
         public int RetryDelayMilliseconds { get; set; }
         public int ExitDelayMilliseconds { get; set; }
+        public ProcessExitAction? ExitActionOverride { get; set; }
+        public DateTimeOffset? DisabledUntilUtc { get; set; }
+        public bool DisabledUntilRestart { get; set; }
         public bool SessionVolumeEnabled { get; set; }
         public int SessionVolumePercent { get; set; }
         public bool SessionMuteEnabled { get; set; }
@@ -1095,6 +1250,15 @@ namespace PrimaryAudioSwitcher
         public bool HasAlternateDevice
         {
             get { return !string.IsNullOrWhiteSpace(AlternateDevice) || !string.IsNullOrWhiteSpace(AlternateDeviceId); }
+        }
+
+        public bool IsTemporarilyDisabled
+        {
+            get
+            {
+                return DisabledUntilRestart ||
+                       (DisabledUntilUtc.HasValue && DisabledUntilUtc.Value > DateTimeOffset.UtcNow);
+            }
         }
 
         public string TargetProcess
@@ -1163,6 +1327,8 @@ namespace PrimaryAudioSwitcher
                 RetryCount = (int?)element.Attribute("retryCount") ?? defaultRetryCount,
                 RetryDelayMilliseconds = (int?)element.Attribute("retryDelayMilliseconds") ?? defaultRetryDelayMilliseconds,
                 ExitDelayMilliseconds = (int?)element.Attribute("exitDelayMilliseconds") ?? 0,
+                ExitActionOverride = ProcessExitActions.ParseNullable((string)element.Attribute("exitAction")),
+                DisabledUntilUtc = ParseDateTimeOffset((string)element.Attribute("disabledUntilUtc")),
                 SessionVolumeEnabled = ((string)element.Attribute("sessionVolumeEnabled") ?? "false").Equals("true", StringComparison.OrdinalIgnoreCase),
                 SessionVolumePercent = (int?)element.Attribute("sessionVolumePercent") ?? 100,
                 SessionMuteEnabled = ((string)element.Attribute("sessionMuteEnabled") ?? "false").Equals("true", StringComparison.OrdinalIgnoreCase),
@@ -1187,6 +1353,9 @@ namespace PrimaryAudioSwitcher
                 RetryCount = RetryCount,
                 RetryDelayMilliseconds = RetryDelayMilliseconds,
                 ExitDelayMilliseconds = ExitDelayMilliseconds,
+                ExitActionOverride = ExitActionOverride,
+                DisabledUntilUtc = DisabledUntilUtc,
+                DisabledUntilRestart = DisabledUntilRestart,
                 SessionVolumeEnabled = SessionVolumeEnabled,
                 SessionVolumePercent = SessionVolumePercent,
                 SessionMuteEnabled = SessionMuteEnabled,
@@ -1208,6 +1377,8 @@ namespace PrimaryAudioSwitcher
                 new XAttribute("retryCount", RetryCount),
                 new XAttribute("retryDelayMilliseconds", RetryDelayMilliseconds),
                 new XAttribute("exitDelayMilliseconds", ExitDelayMilliseconds),
+                new XAttribute("exitAction", ProcessExitActions.ToConfigValue(ExitActionOverride)),
+                new XAttribute("disabledUntilUtc", DisabledUntilUtc.HasValue ? DisabledUntilUtc.Value.UtcDateTime.ToString("O") : ""),
                 new XAttribute("sessionVolumeEnabled", SessionVolumeEnabled ? "true" : "false"),
                 new XAttribute("sessionVolumePercent", SessionVolumePercent),
                 new XAttribute("sessionMuteEnabled", SessionMuteEnabled ? "true" : "false"),
@@ -1229,7 +1400,19 @@ namespace PrimaryAudioSwitcher
         {
             var mode = !string.IsNullOrWhiteSpace(ForegroundProcess) ? "foreground" : "running";
             var process = !string.IsNullOrWhiteSpace(ForegroundProcess) ? ForegroundProcess : RunningProcess;
-            return (Enabled ? "" : "[disabled] ") + (Name ?? "unnamed") + " [" + mode + ": " + (process ?? "") + "] -> " + (Device ?? "");
+            var prefix = IsTemporarilyDisabled ? "[temp disabled] " : Enabled ? "" : "[disabled] ";
+            return prefix + (Name ?? "unnamed") + " [" + (Profile ?? "Default") + " #" + mode + ": " + (process ?? "") + "] -> " + (Device ?? "");
+        }
+
+        private static DateTimeOffset? ParseDateTimeOffset(string value)
+        {
+            DateTimeOffset parsed;
+            if (DateTimeOffset.TryParse(value, out parsed))
+            {
+                return parsed.ToUniversalTime();
+            }
+
+            return null;
         }
 
         private bool MatchesWindowTitle(string actualTitle)
@@ -1327,6 +1510,8 @@ namespace PrimaryAudioSwitcher
         private readonly ComboBox _alternateDevice = new ComboBox();
         private readonly ComboBox _fallback = new ComboBox();
         private readonly ComboBox _exitAction = new ComboBox();
+        private readonly ComboBox _ruleExitAction = new ComboBox();
+        private readonly TextBox _deviceAliases = new TextBox();
         private readonly NumericUpDown _poll = new NumericUpDown();
         private readonly NumericUpDown _cooldown = new NumericUpDown();
         private readonly NumericUpDown _startRetryCount = new NumericUpDown();
@@ -1447,15 +1632,15 @@ namespace PrimaryAudioSwitcher
             {
                 Dock = DockStyle.Fill,
                 ColumnCount = 3,
-                RowCount = 13,
+                RowCount = 14,
                 Padding = new Padding(10, 0, 0, 0)
             };
             editor.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 120));
             editor.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
             editor.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 120));
-            for (var i = 0; i < 13; i++)
+            for (var i = 0; i < 14; i++)
             {
-                editor.RowStyles.Add(new RowStyle(SizeType.Absolute, i == 11 ? 70 : 34));
+                editor.RowStyles.Add(new RowStyle(SizeType.Absolute, i == 12 ? 70 : 34));
             }
             root.Controls.Add(editor, 1, 0);
 
@@ -1508,7 +1693,13 @@ namespace PrimaryAudioSwitcher
             _exitDelay.Maximum = 60000;
             _exitDelay.Increment = 250;
             editor.Controls.Add(_exitDelay, 1, 7);
-            editor.SetColumnSpan(_exitDelay, 2);
+            _ruleExitAction.DropDownStyle = ComboBoxStyle.DropDownList;
+            _ruleExitAction.Items.Add("Use global");
+            _ruleExitAction.Items.Add("Fallback device");
+            _ruleExitAction.Items.Add("Previous device");
+            _ruleExitAction.Items.Add("Do nothing");
+            _ruleExitAction.SelectedIndex = 0;
+            editor.Controls.Add(_ruleExitAction, 2, 7);
 
             AddLabel(editor, "Rule retry", 8);
             _startRetryCount.Minimum = 0;
@@ -1543,12 +1734,16 @@ namespace PrimaryAudioSwitcher
             ruleButtons.Controls.Add(MakeButton("Duplicate", DuplicateRule));
             ruleButtons.Controls.Add(MakeButton("Up", MoveRuleUp));
             ruleButtons.Controls.Add(MakeButton("Down", MoveRuleDown));
+            ruleButtons.Controls.Add(MakeButton("Disable 30m", DisableRuleFor30Minutes));
+            ruleButtons.Controls.Add(MakeButton("Disable run", DisableRuleUntilRestart));
+            ruleButtons.Controls.Add(MakeButton("Enable temp", ClearTemporaryDisable));
             ruleButtons.Controls.Add(MakeButton("Use current", UseCurrentForeground));
             ruleButtons.Controls.Add(MakeButton("Export", ExportRule));
             ruleButtons.Controls.Add(MakeButton("Import", ImportRule));
+            ruleButtons.Controls.Add(MakeButton("Dry run", PreviewRules));
             ruleButtons.Controls.Add(MakeButton("Test", TestRule));
             ruleButtons.Controls.Add(MakeButton("Validate", ValidateRules));
-            editor.Controls.Add(ruleButtons, 1, 11);
+            editor.Controls.Add(ruleButtons, 1, 12);
             editor.SetColumnSpan(ruleButtons, 2);
         }
 
@@ -1558,15 +1753,15 @@ namespace PrimaryAudioSwitcher
             {
                 Dock = DockStyle.Fill,
                 ColumnCount = 3,
-                RowCount = 11,
+                RowCount = 13,
                 Padding = new Padding(10)
             };
             editor.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 120));
             editor.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
             editor.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 150));
-            for (var i = 0; i < 11; i++)
+            for (var i = 0; i < 13; i++)
             {
-                editor.RowStyles.Add(new RowStyle(SizeType.Absolute, 36));
+                editor.RowStyles.Add(new RowStyle(SizeType.Absolute, i == 10 ? 82 : 36));
             }
             tab.Controls.Add(editor);
 
@@ -1645,9 +1840,16 @@ namespace PrimaryAudioSwitcher
             editor.Controls.Add(_notifyFailures, 1, 9);
             editor.SetColumnSpan(_notifyFailures, 2);
 
+            AddLabel(editor, "Aliases", 10);
+            _deviceAliases.Multiline = true;
+            _deviceAliases.ScrollBars = ScrollBars.Vertical;
+            _deviceAliases.Dock = DockStyle.Fill;
+            editor.Controls.Add(_deviceAliases, 1, 10);
+            editor.SetColumnSpan(_deviceAliases, 2);
+
             var undoPanel = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.LeftToRight };
             undoPanel.Controls.Add(MakeButton("Undo changes", UndoChanges));
-            editor.Controls.Add(undoPanel, 1, 10);
+            editor.Controls.Add(undoPanel, 1, 11);
             editor.SetColumnSpan(undoPanel, 2);
         }
 
@@ -1730,6 +1932,7 @@ namespace PrimaryAudioSwitcher
             _roleMultimedia.Checked = Config.RoleMultimedia;
             _roleCommunications.Checked = Config.RoleCommunications;
             _activeProfile.Text = string.IsNullOrWhiteSpace(Config.ActiveProfile) ? "Default" : Config.ActiveProfile;
+            _deviceAliases.Text = FormatAliases(Config.DeviceAliases);
             _exitAction.SelectedIndex = Config.ProcessExitAction == ProcessExitAction.PreviousDevice
                 ? 1
                 : Config.ProcessExitAction == ProcessExitAction.None ? 2 : 0;
@@ -2041,6 +2244,7 @@ namespace PrimaryAudioSwitcher
                 messages.Add("All rules are disabled.");
             }
 
+            Config.DeviceAliases = ParseAliases(_deviceAliases.Text);
             var names = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             foreach (var rule in Config.Rules)
             {
@@ -2052,20 +2256,22 @@ namespace PrimaryAudioSwitcher
                 {
                     messages.Add("Rule has no process: " + (rule.Name ?? "unnamed"));
                 }
-                if (_audio.FindRenderDevice(rule.DeviceId, rule.Device) == null)
+                if (_audio.FindRenderDevice(rule.DeviceId, rule.Device, Config.DeviceAliases) == null)
                 {
                     messages.Add("Primary device not found for rule: " + (rule.Name ?? "unnamed"));
                 }
-                if (rule.HasAlternateDevice && _audio.FindRenderDevice(rule.AlternateDeviceId, rule.AlternateDevice) == null)
+                if (rule.HasAlternateDevice && _audio.FindRenderDevice(rule.AlternateDeviceId, rule.AlternateDevice, Config.DeviceAliases) == null)
                 {
                     messages.Add("Alternate device not found for rule: " + (rule.Name ?? "unnamed"));
                 }
             }
 
-            if (Config.HasFallbackDevice && _audio.FindRenderDevice(Config.FallbackDeviceId, Config.FallbackDevice) == null)
+            if (Config.HasFallbackDevice && _audio.FindRenderDevice(Config.FallbackDeviceId, Config.FallbackDevice, Config.DeviceAliases) == null)
             {
                 messages.Add("Fallback device was not found.");
             }
+
+            messages.AddRange(RuleAnalyzer.FindWarnings(Config));
 
             MessageBox.Show(
                 this,
@@ -2092,6 +2298,7 @@ namespace PrimaryAudioSwitcher
             Config.RoleMultimedia = _roleMultimedia.Checked;
             Config.RoleCommunications = _roleCommunications.Checked;
             Config.ActiveProfile = string.IsNullOrWhiteSpace(_activeProfile.Text) ? "Default" : _activeProfile.Text.Trim();
+            Config.DeviceAliases = ParseAliases(_deviceAliases.Text);
             Config.ProcessExitAction = _exitAction.SelectedIndex == 1
                 ? ProcessExitAction.PreviousDevice
                 : _exitAction.SelectedIndex == 2 ? ProcessExitAction.None : ProcessExitAction.FallbackDevice;
@@ -2131,6 +2338,7 @@ namespace PrimaryAudioSwitcher
                 RetryCount = (int)_startRetryCount.Value,
                 RetryDelayMilliseconds = (int)_startRetryDelay.Value,
                 ExitDelayMilliseconds = (int)_exitDelay.Value,
+                ExitActionOverride = ReadRuleExitAction(),
                 SessionVolumeEnabled = _sessionVolumeEnabled.Checked,
                 SessionVolumePercent = (int)_sessionVolume.Value,
                 SessionMuteEnabled = _sessionMuteEnabled.Checked,
@@ -2166,6 +2374,9 @@ namespace PrimaryAudioSwitcher
             _startRetryCount.Value = Math.Max(_startRetryCount.Minimum, Math.Min(_startRetryCount.Maximum, rule.RetryCount));
             _startRetryDelay.Value = Math.Max(_startRetryDelay.Minimum, Math.Min(_startRetryDelay.Maximum, rule.RetryDelayMilliseconds));
             _exitDelay.Value = Math.Max(_exitDelay.Minimum, Math.Min(_exitDelay.Maximum, rule.ExitDelayMilliseconds));
+            _ruleExitAction.SelectedIndex = rule.ExitActionOverride == ProcessExitAction.FallbackDevice
+                ? 1
+                : rule.ExitActionOverride == ProcessExitAction.PreviousDevice ? 2 : rule.ExitActionOverride == ProcessExitAction.None ? 3 : 0;
             _sessionVolumeEnabled.Checked = rule.SessionVolumeEnabled;
             _sessionVolume.Value = Math.Max(_sessionVolume.Minimum, Math.Min(_sessionVolume.Maximum, rule.SessionVolumePercent));
             _sessionMuteEnabled.Checked = rule.SessionMuteEnabled;
@@ -2186,10 +2397,59 @@ namespace PrimaryAudioSwitcher
                 }
 
                 _visibleRuleIndexes.Add(i);
-                _rules.Items.Add((matching.Contains(i) ? ">> " : "") + Config.Rules[i]);
+                _rules.Items.Add((matching.Contains(i) ? ">> " : "") + (i + 1).ToString("00") + ". " + Config.Rules[i]);
             }
             RefreshStatusSummaries(matching);
             RefreshProfileChoices();
+        }
+
+        private void DisableRuleFor30Minutes(object sender, EventArgs args)
+        {
+            var configIndex = GetSelectedRuleIndex();
+            if (configIndex < 0)
+            {
+                return;
+            }
+
+            Config.Rules[configIndex].DisabledUntilUtc = DateTimeOffset.UtcNow.AddMinutes(30);
+            Config.Rules[configIndex].DisabledUntilRestart = false;
+            ReloadRuleList();
+            SelectRuleByConfigIndex(configIndex);
+        }
+
+        private void DisableRuleUntilRestart(object sender, EventArgs args)
+        {
+            var configIndex = GetSelectedRuleIndex();
+            if (configIndex < 0)
+            {
+                return;
+            }
+
+            Config.Rules[configIndex].DisabledUntilRestart = true;
+            Config.Rules[configIndex].DisabledUntilUtc = null;
+            ReloadRuleList();
+            SelectRuleByConfigIndex(configIndex);
+        }
+
+        private void ClearTemporaryDisable(object sender, EventArgs args)
+        {
+            var configIndex = GetSelectedRuleIndex();
+            if (configIndex < 0)
+            {
+                return;
+            }
+
+            Config.Rules[configIndex].DisabledUntilRestart = false;
+            Config.Rules[configIndex].DisabledUntilUtc = null;
+            ReloadRuleList();
+            SelectRuleByConfigIndex(configIndex);
+        }
+
+        private void PreviewRules(object sender, EventArgs args)
+        {
+            Config.ActiveProfile = string.IsNullOrWhiteSpace(_activeProfile.Text) ? "Default" : _activeProfile.Text.Trim();
+            Config.DeviceAliases = ParseAliases(_deviceAliases.Text);
+            MessageBox.Show(this, RulePreview.Build(Config, _audio), "Rule preview", MessageBoxButtons.OK, MessageBoxIcon.Information);
         }
 
         private HashSet<int> GetMatchingRuleIndexes()
@@ -2285,6 +2545,58 @@ namespace PrimaryAudioSwitcher
                 _activeProfile.Items.Add(profile);
             }
             _activeProfile.Text = string.IsNullOrWhiteSpace(current) ? "Default" : current;
+        }
+
+        private ProcessExitAction? ReadRuleExitAction()
+        {
+            if (_ruleExitAction.SelectedIndex == 1)
+            {
+                return ProcessExitAction.FallbackDevice;
+            }
+            if (_ruleExitAction.SelectedIndex == 2)
+            {
+                return ProcessExitAction.PreviousDevice;
+            }
+            if (_ruleExitAction.SelectedIndex == 3)
+            {
+                return ProcessExitAction.None;
+            }
+
+            return null;
+        }
+
+        private static string FormatAliases(IReadOnlyList<DeviceAlias> aliases)
+        {
+            if (aliases == null || aliases.Count == 0)
+            {
+                return "";
+            }
+
+            return string.Join(Environment.NewLine, aliases.Select(alias =>
+                (alias.Alias ?? "") + "=" + (alias.Device ?? "") + (string.IsNullOrWhiteSpace(alias.DeviceId) ? "" : "|" + alias.DeviceId)));
+        }
+
+        private static List<DeviceAlias> ParseAliases(string text)
+        {
+            var result = new List<DeviceAlias>();
+            foreach (var line in (text ?? "").Split(new[] { "\r\n", "\n" }, StringSplitOptions.RemoveEmptyEntries))
+            {
+                var parts = line.Split(new[] { '=' }, 2);
+                if (parts.Length != 2 || string.IsNullOrWhiteSpace(parts[0]))
+                {
+                    continue;
+                }
+
+                var target = parts[1].Split(new[] { '|' }, 2);
+                result.Add(new DeviceAlias
+                {
+                    Alias = parts[0].Trim(),
+                    Device = target[0].Trim(),
+                    DeviceId = target.Length > 1 ? target[1].Trim() : ""
+                });
+            }
+
+            return result;
         }
 
         private void UndoChanges(object sender, EventArgs args)
@@ -2557,6 +2869,9 @@ namespace PrimaryAudioSwitcher
             builder.AppendLine("Foreground title: " + (foreground.Title ?? ""));
             builder.AppendLine("Current default render: " + CurrentDeviceName(audio));
             builder.AppendLine();
+            builder.AppendLine("Preview:");
+            builder.AppendLine(RulePreview.Build(config, audio).TrimEnd());
+            builder.AppendLine();
 
             builder.AppendLine("Matching rules:");
             foreach (var rule in config.Rules)
@@ -2572,6 +2887,21 @@ namespace PrimaryAudioSwitcher
             foreach (var rule in config.Rules)
             {
                 builder.AppendLine("  " + rule);
+            }
+            builder.AppendLine();
+
+            builder.AppendLine("Rule warnings:");
+            var warnings = RuleAnalyzer.FindWarnings(config).ToList();
+            if (warnings.Count == 0)
+            {
+                builder.AppendLine("  none");
+            }
+            else
+            {
+                foreach (var warning in warnings)
+                {
+                    builder.AppendLine("  " + warning);
+                }
             }
             builder.AppendLine();
 
@@ -2639,6 +2969,263 @@ namespace PrimaryAudioSwitcher
 
         public string Id { get; private set; }
         public string Name { get; private set; }
+    }
+
+    internal static class ConfigBackups
+    {
+        public static void CreateTimestampedBackup(string path, int keepCount)
+        {
+            try
+            {
+                if (!File.Exists(path))
+                {
+                    return;
+                }
+
+                var directory = Path.GetDirectoryName(path);
+                var backupPath = Path.Combine(directory, "config." + DateTimeOffset.Now.ToString("yyyyMMdd-HHmmss") + ".bak.xml");
+                File.Copy(path, backupPath, true);
+                foreach (var oldBackup in Directory.GetFiles(directory, "config.*.bak.xml")
+                    .OrderByDescending(File.GetCreationTimeUtc)
+                    .Skip(Math.Max(1, keepCount)))
+                {
+                    File.Delete(oldBackup);
+                }
+            }
+            catch
+            {
+            }
+        }
+
+        public static string LatestBackupPath(string path)
+        {
+            var directory = Path.GetDirectoryName(path);
+            var latest = Directory.Exists(directory)
+                ? Directory.GetFiles(directory, "config.*.bak.xml")
+                    .OrderByDescending(File.GetCreationTimeUtc)
+                    .FirstOrDefault()
+                : null;
+
+            return latest ?? path + ".bak";
+        }
+    }
+
+    internal static class RuleAnalyzer
+    {
+        public static IEnumerable<string> FindWarnings(AppConfig config)
+        {
+            var warnings = new List<string>();
+            for (var i = 0; i < config.Rules.Count; i++)
+            {
+                var current = config.Rules[i];
+                if (!current.Enabled)
+                {
+                    continue;
+                }
+
+                for (var j = 0; j < i; j++)
+                {
+                    var previous = config.Rules[j];
+                    if (!previous.Enabled)
+                    {
+                        continue;
+                    }
+
+                    if (RulesOverlap(previous, current))
+                    {
+                        warnings.Add("Rule may be hidden by higher priority rule: " + (current.Name ?? "unnamed") + " after " + (previous.Name ?? "unnamed"));
+                        break;
+                    }
+                }
+            }
+
+            foreach (var group in config.Rules
+                .Where(rule => rule.Enabled)
+                .GroupBy(rule => (rule.Profile ?? "Default") + "|" + (rule.ForegroundProcess ?? "") + "|" + (rule.RunningProcess ?? "") + "|" + (rule.WindowTitle ?? ""), StringComparer.OrdinalIgnoreCase)
+                .Where(group => group.Count() > 1))
+            {
+                warnings.Add("Duplicate match condition: " + string.Join(", ", group.Select(rule => rule.Name ?? "unnamed")));
+            }
+
+            return warnings;
+        }
+
+        private static bool RulesOverlap(AudioRule a, AudioRule b)
+        {
+            if (!string.Equals(a.Profile ?? "Default", b.Profile ?? "Default", StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+
+            if (!string.IsNullOrWhiteSpace(a.ForegroundProcess) && !string.IsNullOrWhiteSpace(b.ForegroundProcess))
+            {
+                return ProcessesOverlap(a.ForegroundProcess, b.ForegroundProcess) &&
+                       (string.IsNullOrWhiteSpace(a.WindowTitle) ||
+                        string.IsNullOrWhiteSpace(b.WindowTitle) ||
+                        a.WindowTitle.IndexOf(b.WindowTitle, StringComparison.OrdinalIgnoreCase) >= 0 ||
+                        b.WindowTitle.IndexOf(a.WindowTitle, StringComparison.OrdinalIgnoreCase) >= 0);
+            }
+
+            if (!string.IsNullOrWhiteSpace(a.RunningProcess) && !string.IsNullOrWhiteSpace(b.RunningProcess))
+            {
+                return ProcessesOverlap(a.RunningProcess, b.RunningProcess);
+            }
+
+            return false;
+        }
+
+        private static bool ProcessesOverlap(string left, string right)
+        {
+            var leftSet = SplitProcesses(left);
+            var rightSet = SplitProcesses(right);
+            return leftSet.Any(process => rightSet.Contains(process, StringComparer.OrdinalIgnoreCase));
+        }
+
+        private static List<string> SplitProcesses(string value)
+        {
+            return (value ?? "").Split(new[] { ';', ',' }, StringSplitOptions.RemoveEmptyEntries)
+                .Select(process => process.Trim().EndsWith(".exe", StringComparison.OrdinalIgnoreCase)
+                    ? Path.GetFileNameWithoutExtension(process.Trim())
+                    : process.Trim())
+                .Where(process => !string.IsNullOrWhiteSpace(process))
+                .ToList();
+        }
+    }
+
+    internal static class RulePreview
+    {
+        public static string Build(AppConfig config, AudioDeviceManager audio)
+        {
+            var foreground = ForegroundWindowReader.GetForegroundWindowInfo();
+            var running = new HashSet<string>(
+                Process.GetProcesses()
+                    .Select(p => SafeProcessName(p))
+                    .Where(name => !string.IsNullOrWhiteSpace(name)),
+                StringComparer.OrdinalIgnoreCase);
+            var builder = new StringBuilder();
+            builder.AppendLine("Active profile: " + (config.ActiveProfile ?? "Default"));
+            builder.AppendLine("Foreground: " + (foreground.ProcessName ?? "unknown"));
+            builder.AppendLine("Title: " + (foreground.Title ?? ""));
+            builder.AppendLine();
+
+            foreach (var rule in config.Rules)
+            {
+                if (!config.IsRuleInActiveProfile(rule) || rule.IsTemporarilyDisabled)
+                {
+                    continue;
+                }
+
+                if (rule.IsMatch(foreground, running))
+                {
+                    var device = audio.FindRenderDevice(rule.DeviceId, rule.Device, config.DeviceAliases) ??
+                                 audio.FindRenderDevice(rule.AlternateDeviceId, rule.AlternateDevice, config.DeviceAliases);
+                    builder.AppendLine("Matched rule: " + (rule.Name ?? "unnamed"));
+                    builder.AppendLine("Target device: " + (device == null ? "not found" : device.Name));
+                    builder.AppendLine("Exit action: " + ProcessExitActions.ToConfigValue(rule.ExitActionOverride ?? config.ProcessExitAction));
+                    return builder.ToString();
+                }
+            }
+
+            builder.AppendLine("No rule matched.");
+            if (config.HasFallbackDevice)
+            {
+                var fallback = audio.FindRenderDevice(config.FallbackDeviceId, config.FallbackDevice, config.DeviceAliases);
+                builder.AppendLine("Fallback device: " + (fallback == null ? "not found" : fallback.Name));
+            }
+
+            return builder.ToString();
+        }
+
+        private static string SafeProcessName(Process process)
+        {
+            try
+            {
+                return process.ProcessName;
+            }
+            catch
+            {
+                return null;
+            }
+            finally
+            {
+                process.Dispose();
+            }
+        }
+    }
+
+    internal static class HotKeyManager
+    {
+        private const int WmHotKey = 0x0312;
+        private const uint ModAlt = 0x0001;
+        private const uint ModControl = 0x0002;
+        private static HotKeyMessageFilter _filter;
+
+        public static void Register(Control target, Action togglePause, Action evaluate, Action cycleDevice, Action cycleProfile)
+        {
+            Unregister(target);
+            _filter = new HotKeyMessageFilter(target.Handle, togglePause, evaluate, cycleDevice, cycleProfile);
+            Application.AddMessageFilter(_filter);
+            RegisterHotKey(target.Handle, 1, ModControl | ModAlt, (uint)Keys.P);
+            RegisterHotKey(target.Handle, 2, ModControl | ModAlt, (uint)Keys.R);
+            RegisterHotKey(target.Handle, 3, ModControl | ModAlt, (uint)Keys.D);
+            RegisterHotKey(target.Handle, 4, ModControl | ModAlt, (uint)Keys.O);
+        }
+
+        public static void Unregister(Control target)
+        {
+            if (_filter != null)
+            {
+                Application.RemoveMessageFilter(_filter);
+                _filter = null;
+            }
+
+            if (target != null && target.IsHandleCreated)
+            {
+                for (var id = 1; id <= 4; id++)
+                {
+                    UnregisterHotKey(target.Handle, id);
+                }
+            }
+        }
+
+        [DllImport("user32.dll")]
+        private static extern bool RegisterHotKey(IntPtr hWnd, int id, uint fsModifiers, uint vk);
+
+        [DllImport("user32.dll")]
+        private static extern bool UnregisterHotKey(IntPtr hWnd, int id);
+
+        private sealed class HotKeyMessageFilter : IMessageFilter
+        {
+            private readonly IntPtr _handle;
+            private readonly Action _togglePause;
+            private readonly Action _evaluate;
+            private readonly Action _cycleDevice;
+            private readonly Action _cycleProfile;
+
+            public HotKeyMessageFilter(IntPtr handle, Action togglePause, Action evaluate, Action cycleDevice, Action cycleProfile)
+            {
+                _handle = handle;
+                _togglePause = togglePause;
+                _evaluate = evaluate;
+                _cycleDevice = cycleDevice;
+                _cycleProfile = cycleProfile;
+            }
+
+            public bool PreFilterMessage(ref Message m)
+            {
+                if (m.Msg != WmHotKey || m.HWnd != _handle)
+                {
+                    return false;
+                }
+
+                var id = m.WParam.ToInt32();
+                if (id == 1) _togglePause();
+                if (id == 2) _evaluate();
+                if (id == 3) _cycleDevice();
+                if (id == 4) _cycleProfile();
+                return true;
+            }
+        }
     }
 
     internal static class StartupManager
@@ -2789,7 +3376,45 @@ namespace PrimaryAudioSwitcher
 
         public AudioDevice FindRenderDevice(string deviceId, string deviceMatch)
         {
+            return FindRenderDevice(deviceId, deviceMatch, null);
+        }
+
+        public AudioDevice FindRenderDevice(string deviceId, string deviceMatch, IReadOnlyList<DeviceAlias> aliases)
+        {
             var devices = ListRenderDevices();
+            if (!string.IsNullOrWhiteSpace(deviceId))
+            {
+                var exact = devices.FirstOrDefault(d => string.Equals(d.Id, deviceId, StringComparison.OrdinalIgnoreCase));
+                if (exact != null)
+                {
+                    return exact;
+                }
+            }
+
+            if (!string.IsNullOrWhiteSpace(deviceMatch) && aliases != null)
+            {
+                var alias = aliases.FirstOrDefault(item => !string.IsNullOrWhiteSpace(item.Alias) &&
+                    item.Alias.Equals(deviceMatch, StringComparison.OrdinalIgnoreCase));
+                if (alias != null)
+                {
+                    var aliased = FindInDevices(devices, alias.DeviceId, alias.Device);
+                    if (aliased != null)
+                    {
+                        return aliased;
+                    }
+                }
+            }
+
+            if (string.IsNullOrWhiteSpace(deviceMatch))
+            {
+                return null;
+            }
+
+            return FindInDevices(devices, null, deviceMatch);
+        }
+
+        private static AudioDevice FindInDevices(IEnumerable<AudioDevice> devices, string deviceId, string deviceMatch)
+        {
             if (!string.IsNullOrWhiteSpace(deviceId))
             {
                 var exact = devices.FirstOrDefault(d => string.Equals(d.Id, deviceId, StringComparison.OrdinalIgnoreCase));
