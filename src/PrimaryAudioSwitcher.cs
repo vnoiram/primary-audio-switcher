@@ -159,8 +159,13 @@ namespace PrimaryAudioSwitcher
 
         private void SelectProfile(string profile)
         {
+            var previous = _config.ActiveProfile;
             _config.ActiveProfile = profile;
-            _config.Save(_configPath);
+            if (!SaveConfig("profile change"))
+            {
+                _config.ActiveProfile = previous;
+                return;
+            }
             _lastAppliedDeviceId = null;
             SetStatus("Profile: " + profile);
             EvaluateRules();
@@ -642,8 +647,13 @@ namespace PrimaryAudioSwitcher
             }
 
             var current = profiles.FindIndex(profile => profile.Equals(_config.ActiveProfile ?? "Default", StringComparison.OrdinalIgnoreCase));
+            var previous = _config.ActiveProfile;
             _config.ActiveProfile = profiles[(current + 1 + profiles.Count) % profiles.Count];
-            _config.Save(_configPath);
+            if (!SaveConfig("profile cycle"))
+            {
+                _config.ActiveProfile = previous;
+                return;
+            }
             SetStatus("Profile: " + _config.ActiveProfile);
             EvaluateRules();
         }
@@ -699,7 +709,10 @@ namespace PrimaryAudioSwitcher
                     return;
                 }
 
-                form.Config.Save(_configPath);
+                if (!SaveConfig(form.Config, "settings"))
+                {
+                    return;
+                }
                 _config = form.Config;
                 _timer.Interval = Math.Max(250, _config.PollMilliseconds);
                 StartWatchers();
@@ -713,9 +726,15 @@ namespace PrimaryAudioSwitcher
 
         private void TogglePause()
         {
+            var previousPaused = _paused;
             _paused = !_paused;
             _config.Paused = _paused;
-            _config.Save(_configPath);
+            if (!SaveConfig("pause toggle"))
+            {
+                _paused = previousPaused;
+                _config.Paused = previousPaused;
+                return;
+            }
             SetPauseMenuText();
             SetStatus(_paused ? "Paused. Current: " + CurrentDeviceName() : "Resumed");
             if (!_paused)
@@ -730,6 +749,26 @@ namespace PrimaryAudioSwitcher
             if (item != null)
             {
                 item.Text = _paused ? "Resume automation" : "Pause automation";
+            }
+        }
+
+        private bool SaveConfig(string operation)
+        {
+            return SaveConfig(_config, operation);
+        }
+
+        private bool SaveConfig(AppConfig config, string operation)
+        {
+            try
+            {
+                config.Save(_configPath);
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Log("Config save failed during " + operation + ": " + ex);
+                MessageBox.Show(ex.Message, "Primary Audio Switcher save error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return false;
             }
         }
 
@@ -928,8 +967,14 @@ namespace PrimaryAudioSwitcher
             }
 
             var path = LogPath();
-            RotateLogIfNeeded(path);
-            File.AppendAllText(path, DateTimeOffset.Now.ToString("O") + " " + message + Environment.NewLine);
+            try
+            {
+                RotateLogIfNeeded(path);
+                File.AppendAllText(path, DateTimeOffset.Now.ToString("O") + " " + message + Environment.NewLine);
+            }
+            catch
+            {
+            }
         }
 
         private string LogPath()
@@ -1190,14 +1235,41 @@ namespace PrimaryAudioSwitcher
 
             var document = new XDocument(new XDeclaration("1.0", "utf-8", "yes"), root);
             var temporaryPath = path + ".tmp";
-            document.Save(temporaryPath);
-            if (File.Exists(path))
+            try
             {
-                File.Replace(temporaryPath, path, null);
+                document.Save(temporaryPath);
+                ReplaceFile(temporaryPath, path);
             }
-            else
+            finally
             {
-                File.Move(temporaryPath, path);
+                if (File.Exists(temporaryPath))
+                {
+                    File.Delete(temporaryPath);
+                }
+            }
+        }
+
+        private static void ReplaceFile(string sourcePath, string destinationPath)
+        {
+            if (!File.Exists(destinationPath))
+            {
+                File.Move(sourcePath, destinationPath);
+                return;
+            }
+
+            try
+            {
+                File.Replace(sourcePath, destinationPath, null);
+            }
+            catch (IOException)
+            {
+                File.Copy(sourcePath, destinationPath, true);
+                File.Delete(sourcePath);
+            }
+            catch (UnauthorizedAccessException)
+            {
+                File.Copy(sourcePath, destinationPath, true);
+                File.Delete(sourcePath);
             }
         }
 
@@ -3207,7 +3279,7 @@ namespace PrimaryAudioSwitcher
                 }
 
                 var directory = Path.GetDirectoryName(path);
-                var backupPath = Path.Combine(directory, "config." + DateTimeOffset.Now.ToString("yyyyMMdd-HHmmss") + ".bak.xml");
+                var backupPath = Path.Combine(directory, "config." + DateTimeOffset.Now.ToString("yyyyMMdd-HHmmss-fff") + ".bak.xml");
                 File.Copy(path, backupPath, true);
                 foreach (var oldBackup in Directory.GetFiles(directory, "config.*.bak.xml")
                     .OrderByDescending(File.GetCreationTimeUtc)
@@ -3383,16 +3455,20 @@ namespace PrimaryAudioSwitcher
         private const uint ModAlt = 0x0001;
         private const uint ModControl = 0x0002;
         private static HotKeyMessageFilter _filter;
+        private static readonly List<int> RegisteredIds = new List<int>();
 
         public static void Register(Control target, Action togglePause, Action evaluate, Action cycleDevice, Action cycleProfile)
         {
             Unregister(target);
-            _filter = new HotKeyMessageFilter(target.Handle, togglePause, evaluate, cycleDevice, cycleProfile);
-            Application.AddMessageFilter(_filter);
-            RegisterHotKey(target.Handle, 1, ModControl | ModAlt, (uint)Keys.P);
-            RegisterHotKey(target.Handle, 2, ModControl | ModAlt, (uint)Keys.R);
-            RegisterHotKey(target.Handle, 3, ModControl | ModAlt, (uint)Keys.D);
-            RegisterHotKey(target.Handle, 4, ModControl | ModAlt, (uint)Keys.O);
+            TryRegister(target.Handle, 1, Keys.P);
+            TryRegister(target.Handle, 2, Keys.R);
+            TryRegister(target.Handle, 3, Keys.D);
+            TryRegister(target.Handle, 4, Keys.O);
+            if (RegisteredIds.Count > 0)
+            {
+                _filter = new HotKeyMessageFilter(target.Handle, togglePause, evaluate, cycleDevice, cycleProfile);
+                Application.AddMessageFilter(_filter);
+            }
         }
 
         public static void Unregister(Control target)
@@ -3405,10 +3481,19 @@ namespace PrimaryAudioSwitcher
 
             if (target != null && target.IsHandleCreated)
             {
-                for (var id = 1; id <= 4; id++)
+                foreach (var id in RegisteredIds.ToList())
                 {
                     UnregisterHotKey(target.Handle, id);
                 }
+            }
+            RegisteredIds.Clear();
+        }
+
+        private static void TryRegister(IntPtr handle, int id, Keys key)
+        {
+            if (RegisterHotKey(handle, id, ModControl | ModAlt, (uint)key))
+            {
+                RegisteredIds.Add(id);
             }
         }
 
