@@ -63,6 +63,8 @@ Settings are split into tabs:
 - Define device aliases in `Global` with `Alias=Device substring` lines, then use the alias as a rule device.
 - Choose which Windows default endpoint roles are changed: Console, Multimedia, and/or Communications.
 - Enable switch-failure notifications separately from normal change notifications.
+- Suppress notifications during quiet hours.
+- Rotate the log when it reaches the configured size.
 - Filter rules by name, profile, process, title, or device.
 - Undo settings-window changes back to the values loaded when the dialog opened.
 - Set per-app audio session volume and mute state when a rule applies.
@@ -90,7 +92,7 @@ Settings are split into tabs:
 - Restore the newest timestamped config backup from the tray menu. The app keeps the latest five `config.*.bak.xml` files.
 - Re-evaluate rules automatically when Windows reports device connection changes.
 - Re-evaluate rules manually from the tray menu.
-- Cycle the current output device or active profile from the tray menu.
+- Select or cycle the current output device or active profile from the tray menu.
 - Use global hotkeys: `Ctrl+Alt+P` pause/resume, `Ctrl+Alt+R` re-evaluate, `Ctrl+Alt+D` cycle device, `Ctrl+Alt+O` cycle profile.
 - Duplicate rules from the `Rules` tab.
 - Fill a rule from the current foreground app with `Use current`.
@@ -109,7 +111,7 @@ Example:
 
 ```xml
 <?xml version="1.0" encoding="utf-8"?>
-<PrimaryAudioSwitcher pollMilliseconds="1000" fallbackDevice="" fallbackDeviceId="" log="true" notifications="false" notifyFailures="true" paused="false" processStartWatcher="true" deviceChangeWatcher="true" roleConsole="true" roleMultimedia="true" roleCommunications="true" activeProfile="Default" switchCooldownMilliseconds="0" processExitAction="fallback">
+<PrimaryAudioSwitcher pollMilliseconds="1000" fallbackDevice="" fallbackDeviceId="" log="true" logMaxKilobytes="1024" notifications="false" notificationQuietHours="false" notificationQuietStart="22:00" notificationQuietEnd="07:00" notifyFailures="true" paused="false" processStartWatcher="true" deviceChangeWatcher="true" roleConsole="true" roleMultimedia="true" roleCommunications="true" activeProfile="Default" switchCooldownMilliseconds="0" processExitAction="fallback">
   <DeviceAlias alias="Headset" device="Headset" deviceId="" />
   <Rule name="Game foreground" profile="Default" enabled="true" foregroundProcess="Game.exe" windowTitle="" device="Speakers" deviceId="" alternateDevice="" alternateDeviceId="" retryCount="3" retryDelayMilliseconds="500" exitDelayMilliseconds="0" exitAction="global" disabledUntilUtc="" sessionVolumeEnabled="false" sessionVolumePercent="100" sessionMuteEnabled="false" sessionMuted="false" />
   <Rule name="Discord running" profile="Default" enabled="true" runningProcess="Discord.exe" windowTitle="" device="Headset" deviceId="" alternateDevice="" alternateDeviceId="" retryCount="3" retryDelayMilliseconds="500" exitDelayMilliseconds="0" sessionVolumeEnabled="false" sessionVolumePercent="100" sessionMuteEnabled="false" sessionMuted="false" />
@@ -151,6 +153,10 @@ Per-rule `sessionVolumeEnabled` / `sessionVolumePercent` and `sessionMuteEnabled
 `DeviceAlias` maps a stable alias to a device substring or endpoint ID. Rules can use the alias in `device` or `alternateDevice`, which helps when Windows device names change.
 
 Per-rule `exitAction` accepts `global`, `fallback`, `previous`, or `none`. `disabledUntilUtc` can temporarily suppress a rule until a UTC timestamp; the Settings window also supports a restart-only temporary disable that is not written to XML.
+
+`notificationQuietHours`, `notificationQuietStart`, and `notificationQuietEnd` suppress tray balloons during the configured local-time window. `logMaxKilobytes` rotates the app log to `.1` before appending once the file grows past the limit.
+
+Config saves are written through a temporary file and then replaced, so interruption during save is less likely to leave a partial XML file.
 
 ## Notes
 
