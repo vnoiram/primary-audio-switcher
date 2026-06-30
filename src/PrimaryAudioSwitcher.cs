@@ -47,6 +47,7 @@ namespace PrimaryAudioSwitcher
         private ManagementEventWatcher _processStartWatcher;
         private ManagementEventWatcher _processStopWatcher;
         private ManagementEventWatcher _deviceChangeWatcher;
+        private System.Windows.Forms.Timer _deviceChangeDebounce;
         private readonly Dictionary<string, string> _previousDeviceByRule = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         private readonly List<SwitchHistoryItem> _switchHistory = new List<SwitchHistoryItem>();
         private AppConfig _config;
@@ -77,6 +78,7 @@ namespace PrimaryAudioSwitcher
                 Visible = true,
                 ContextMenuStrip = BuildMenu()
             };
+            _notifyIcon.MouseDoubleClick += (sender, args) => { if (args.Button == MouseButtons.Left) OpenSettings(); };
 
             _timer = new System.Windows.Forms.Timer { Interval = Math.Max(250, _config.PollMilliseconds) };
             _timer.Tick += (sender, eventArgs) => EvaluateRules();
@@ -414,9 +416,21 @@ namespace PrimaryAudioSwitcher
             {
                 _uiThread.BeginInvoke((MethodInvoker)delegate
                 {
-                    Log("Device change event received");
-                    _lastAppliedDeviceId = null;
-                    EvaluateRules();
+                    if (_deviceChangeDebounce == null)
+                    {
+                        _deviceChangeDebounce = new System.Windows.Forms.Timer { Interval = 500 };
+                        _deviceChangeDebounce.Tick += delegate
+                        {
+                            _deviceChangeDebounce.Stop();
+                            _deviceChangeDebounce.Dispose();
+                            _deviceChangeDebounce = null;
+                            Log("Device change event received");
+                            _lastAppliedDeviceId = null;
+                            EvaluateRules();
+                        };
+                    }
+                    _deviceChangeDebounce.Stop();
+                    _deviceChangeDebounce.Start();
                 });
             }
             catch
@@ -620,7 +634,10 @@ namespace PrimaryAudioSwitcher
                     retryTimer.Dispose();
                     if (IsProcessRunning(processName))
                     {
-                        ApplyDevice(retryRule.DeviceId, retryRule.Device, retryRule.AlternateDeviceId, retryRule.AlternateDevice, retryRule.Name + " (process start retry " + retryIndex + ")", processName, true);
+                        if (ApplyDevice(retryRule.DeviceId, retryRule.Device, retryRule.AlternateDeviceId, retryRule.AlternateDevice, retryRule.Name + " (process start retry " + retryIndex + ")", processName, true))
+                        {
+                            _audio.ApplySessionSettings(retryRule.TargetProcesses, retryRule.SessionVolumeEnabled, retryRule.SessionVolumePercent, retryRule.SessionMuteEnabled, retryRule.SessionMuted);
+                        }
                     }
                 };
                 retryTimer.Start();
@@ -702,7 +719,7 @@ namespace PrimaryAudioSwitcher
 
         private void OpenSettings()
         {
-            using (var form = new SettingsForm(_config, _audio, _switchHistory))
+            using (var form = new SettingsForm(_config, _audio, _switchHistory, LogPath()))
             {
                 if (form.ShowDialog() != DialogResult.OK)
                 {
@@ -1009,6 +1026,12 @@ namespace PrimaryAudioSwitcher
             HotKeyManager.Unregister(_uiThread);
             StopProcessStartWatcher();
             StopWatcher(ref _deviceChangeWatcher, DeviceChangeWatcherOnEventArrived);
+            if (_deviceChangeDebounce != null)
+            {
+                _deviceChangeDebounce.Stop();
+                _deviceChangeDebounce.Dispose();
+                _deviceChangeDebounce = null;
+            }
             _timer.Stop();
             _timer.Dispose();
             _notifyIcon.Visible = false;
@@ -1743,6 +1766,7 @@ namespace PrimaryAudioSwitcher
     internal sealed class SettingsForm : Form
     {
         private readonly AudioDeviceManager _audio;
+        private readonly string _logPath;
         private AppConfig _originalConfig;
         private readonly ListBox _rules = new ListBox();
         private readonly List<int> _visibleRuleIndexes = new List<int>();
@@ -1788,9 +1812,10 @@ namespace PrimaryAudioSwitcher
         private readonly ListBox _history = new ListBox();
         private readonly IReadOnlyList<SwitchHistoryItem> _switchHistory;
 
-        public SettingsForm(AppConfig config, AudioDeviceManager audio, IReadOnlyList<SwitchHistoryItem> switchHistory)
+        public SettingsForm(AppConfig config, AudioDeviceManager audio, IReadOnlyList<SwitchHistoryItem> switchHistory, string logPath)
         {
             _audio = audio;
+            _logPath = logPath;
             _switchHistory = switchHistory;
             Config = config.Clone();
             _originalConfig = config.Clone();
@@ -2277,11 +2302,7 @@ namespace PrimaryAudioSwitcher
 
         private void ViewLog(object sender, EventArgs args)
         {
-            var path = Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
-                "PrimaryAudioSwitcher",
-                "primary-audio-switcher.log");
-            using (var form = new LogViewerForm(path))
+            using (var form = new LogViewerForm(_logPath))
             {
                 form.ShowDialog(this);
             }
@@ -2992,6 +3013,8 @@ namespace PrimaryAudioSwitcher
     {
         private readonly string _path;
         private readonly TextBox _text = new TextBox();
+        private readonly TextBox _filter = new TextBox();
+        private string[] _allLines;
 
         public LogViewerForm(string path)
         {
@@ -3010,13 +3033,21 @@ namespace PrimaryAudioSwitcher
             var root = new TableLayoutPanel
             {
                 Dock = DockStyle.Fill,
-                RowCount = 2,
+                RowCount = 3,
                 ColumnCount = 1,
                 Padding = new Padding(10)
             };
+            root.RowStyles.Add(new RowStyle(SizeType.Absolute, 36));
             root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
             root.RowStyles.Add(new RowStyle(SizeType.Absolute, 40));
             Controls.Add(root);
+
+            var filterPanel = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.LeftToRight };
+            filterPanel.Controls.Add(new Label { Text = "Filter:", AutoSize = true, TextAlign = ContentAlignment.MiddleLeft, Padding = new Padding(0, 6, 6, 0) });
+            _filter.Width = 340;
+            _filter.TextChanged += delegate { ApplyFilter(); };
+            filterPanel.Controls.Add(_filter);
+            root.Controls.Add(filterPanel, 0, 0);
 
             _text.Dock = DockStyle.Fill;
             _text.Multiline = true;
@@ -3024,7 +3055,7 @@ namespace PrimaryAudioSwitcher
             _text.ScrollBars = ScrollBars.Both;
             _text.WordWrap = false;
             _text.Font = new Font(FontFamily.GenericMonospace, 9f);
-            root.Controls.Add(_text, 0, 0);
+            root.Controls.Add(_text, 0, 1);
 
             var buttons = new FlowLayoutPanel
             {
@@ -3034,7 +3065,7 @@ namespace PrimaryAudioSwitcher
             buttons.Controls.Add(MakeButton("Close", delegate { Close(); }));
             buttons.Controls.Add(MakeButton("Refresh", delegate { LoadLog(); }));
             buttons.Controls.Add(MakeButton("Clear", delegate { ClearLog(); }));
-            root.Controls.Add(buttons, 0, 1);
+            root.Controls.Add(buttons, 0, 2);
         }
 
         private static Button MakeButton(string text, EventHandler handler)
@@ -3053,14 +3084,31 @@ namespace PrimaryAudioSwitcher
         {
             try
             {
-                _text.Text = File.Exists(_path) ? File.ReadAllText(_path) : "";
-                _text.SelectionStart = _text.TextLength;
-                _text.ScrollToCaret();
+                var content = File.Exists(_path) ? File.ReadAllText(_path) : "";
+                _allLines = content.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None);
+                ApplyFilter();
             }
             catch (Exception ex)
             {
+                _allLines = null;
                 _text.Text = ex.Message;
             }
+        }
+
+        private void ApplyFilter()
+        {
+            if (_allLines == null)
+            {
+                return;
+            }
+
+            var f = (_filter.Text ?? "").Trim();
+            var lines = string.IsNullOrEmpty(f)
+                ? _allLines
+                : _allLines.Where(line => line.IndexOf(f, StringComparison.OrdinalIgnoreCase) >= 0).ToArray();
+            _text.Text = string.Join(Environment.NewLine, lines);
+            _text.SelectionStart = _text.TextLength;
+            _text.ScrollToCaret();
         }
 
         private void ClearLog()
